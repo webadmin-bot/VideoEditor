@@ -2,7 +2,7 @@
 """
 AI Video Studio — Installation and Hardware Verification Script
 Tests PyTorch CUDA 12.8, actual CUDA tensor execution, NVIDIA driver compatibility,
-FFmpeg NVENC live initialization test encodes, and AI model subsystems.
+FFmpeg NVENC live initialization test encodes, Real-ESRGAN model weights, and AI subsystems.
 """
 
 import sys
@@ -10,6 +10,7 @@ import os
 import subprocess
 import shutil
 import re
+from pathlib import Path
 
 def print_header(title: str):
     print("\n" + "=" * 65)
@@ -155,30 +156,82 @@ def check_ffmpeg_nvenc():
     return verified
 
 def check_ai_subsystems():
-    print_header("AI Subsystems Status")
+    print_header("AI Subsystems & Model Weights Status")
 
-    # Faster-Whisper
+    # 1. Faster-Whisper
     try:
         import faster_whisper
-        print(f"  • Faster-Whisper: Installed (v{getattr(faster_whisper, '__version__', 'unknown')})")
+        print(f"  • Faster-Whisper : Installed (v{getattr(faster_whisper, '__version__', 'unknown')})")
     except ImportError:
-        print("  • Faster-Whisper: Not installed (Speech transcription will be unavailable)")
+        print("  • Faster-Whisper : Not installed (Run 'pip install faster-whisper')")
 
-    # Real-ESRGAN
+    # 2. Real-ESRGAN Packages & Model Weights
+    models_dir = Path("storage/models/realesrgan")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    
+    weights_x4 = models_dir / "RealESRGAN_x4plus.pth"
+    weights_x2 = models_dir / "RealESRGAN_x2plus.pth"
+    
+    has_x4 = weights_x4.exists() and weights_x4.stat().st_size > 1024 * 1024
+    has_x2 = weights_x2.exists() and weights_x2.stat().st_size > 1024 * 1024
+
+    realesrgan_pkg = False
     try:
         import realesrgan
-        print(f"  • Real-ESRGAN: Installed (Neural resolution upscaling available)")
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        realesrgan_pkg = True
+        print(f"  • Real-ESRGAN   : Package Installed")
     except ImportError:
-        print("  • Real-ESRGAN: Not installed (Conventional Lanczos scaling will be used for resolution adjustments)")
+        print("  • Real-ESRGAN   : Package Not Installed (Run 'pip install realesrgan')")
 
-    # Google GenAI SDK
+    if has_x4 or has_x2:
+        found = []
+        if has_x4: found.append(f"RealESRGAN_x4plus.pth ({round(weights_x4.stat().st_size / (1024*1024), 1)} MB)")
+        if has_x2: found.append(f"RealESRGAN_x2plus.pth ({round(weights_x2.stat().st_size / (1024*1024), 1)} MB)")
+        print(f"  • Weights Status: Available in {models_dir} ({', '.join(found)})")
+    else:
+        print(f"  • Weights Status: Missing weights in {models_dir}")
+        print("    [NOTICE] To enable neural upscaling, download:")
+        print("             https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth")
+        print(f"             and place into: {models_dir.resolve()}/")
+
+    # Test Live Inference if package and weights present
+    if realesrgan_pkg and (has_x4 or has_x2):
+        print("\n  Testing Real-ESRGAN Inference with synthetic test image...")
+        try:
+            import torch
+            import numpy as np
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_file = weights_x4 if has_x4 else weights_x2
+            scale = 4 if has_x4 else 2
+            
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
+            upsampler = RealESRGANer(
+                scale=scale,
+                model_path=str(model_file),
+                model=model,
+                tile=256,
+                tile_pad=10,
+                pre_pad=0,
+                half=(device == "cuda"),
+                device=torch.device(device)
+            )
+            dummy = np.zeros((32, 32, 3), dtype=np.uint8)
+            dummy[8:24, 8:24, :] = 255
+            out, _ = upsampler.enhance(dummy, outscale=scale)
+            print(f"  [PASS] Real-ESRGAN Test Inference Succeeded on {device.upper()}! Output shape: {out.shape}")
+        except Exception as e:
+            print(f"  [FAIL] Real-ESRGAN inference test failed: {e}")
+
+    # 3. Google GenAI SDK
     try:
         from google import genai
         api_key = os.getenv("GEMINI_API_KEY", "")
-        key_status = "Configured" if api_key else "Missing GEMINI_API_KEY env var"
-        print(f"  • Google GenAI SDK: Installed ({key_status})")
+        key_status = "Configured" if api_key else "Missing GEMINI_API_KEY in .env"
+        print(f"  • Google GenAI  : Installed ({key_status})")
     except ImportError:
-        print("  • Google GenAI SDK: Not installed")
+        print("  • Google GenAI  : Not installed")
 
 def main():
     print("=" * 65)

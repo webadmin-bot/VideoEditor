@@ -2,90 +2,189 @@ import os
 import shutil
 import subprocess
 import base64
+import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
+
+
+from ..config import MODELS_DIR, TEMP_DIR
+
+logger = logging.getLogger("ai_video_studio.enhancer")
+
+MODEL_WEIGHTS_MAP = {
+    "Real-ESRGAN-x4": "RealESRGAN_x4plus.pth",
+    "Real-ESRGAN-x2": "RealESRGAN_x2plus.pth",
+    "RealESRGAN_x4plus": "RealESRGAN_x4plus.pth",
+    "RealESRGAN_x2plus": "RealESRGAN_x2plus.pth"
+}
+
+def find_model_weights(model_name: str) -> Optional[Path]:
+    """
+    Locates verified model weights on local storage.
+    Verifies that the file exists and has valid non-trivial size (> 1MB).
+    """
+    filename = MODEL_WEIGHTS_MAP.get(model_name, "RealESRGAN_x4plus.pth")
+    candidate_paths = [
+        MODELS_DIR / filename,
+        Path("storage/models/realesrgan") / filename,
+        Path("weights") / filename,
+        Path("backend/weights") / filename,
+        Path.home() / ".cache" / "realesrgan" / filename
+    ]
+
+    for p in candidate_paths:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 1024 * 1024:
+                return p.resolve()
+        except Exception:
+            continue
+
+    return None
 
 def check_realesrgan_available() -> Dict[str, Any]:
     """
-    Checks if Real-ESRGAN dependencies and model weights are installed and available.
-    Accurately reports status without pretending AI models work if missing.
+    Checks if Real-ESRGAN packages, architecture dependencies, and actual weights exist.
+    Never reports AI upscaling as available unless weights exist on local disk.
     """
     installed = False
     available = False
     device = "cpu"
-    error = None
+    errors = []
+    found_models: List[str] = []
 
+    # 1. PyTorch & Device Check
     try:
         import torch
         if torch.cuda.is_available():
             device = "cuda"
     except ImportError:
-        pass
+        errors.append("PyTorch is not installed in the Python environment.")
 
+    # 2. Package & Architecture Check
     try:
         import realesrgan
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
         installed = True
-        available = True
-    except ImportError:
+    except ImportError as e:
         installed = False
-        available = False
-        error = "Real-ESRGAN python package ('realesrgan') is not installed. AI neural upscaling is unavailable."
+        errors.append(f"Real-ESRGAN / BasicSR package import failed: {e}")
+
+    # 3. Weights Check
+    if installed:
+        for m_name in ["Real-ESRGAN-x4", "Real-ESRGAN-x2"]:
+            w_path = find_model_weights(m_name)
+            if w_path:
+                found_models.append(m_name)
+
+        if found_models:
+            available = True
+        else:
+            errors.append(
+                f"Real-ESRGAN model weights not found. Please place 'RealESRGAN_x4plus.pth' "
+                f"or 'RealESRGAN_x2plus.pth' in {MODELS_DIR}"
+            )
 
     return {
         "installed": installed,
         "available": available,
         "device": device,
-        "models": ["Real-ESRGAN-x2", "Real-ESRGAN-x4"] if available else [],
-        "error": error
+        "models": found_models,
+        "weights_dir": str(MODELS_DIR),
+        "error": " | ".join(errors) if errors else None
     }
 
-def run_realesrgan_upscale(
-    image_input,
+def load_realesrgan_upsampler(
     model_name: str = "Real-ESRGAN-x4",
     tile_size: int = 512,
-    device: str = "cuda"
+    device: Optional[str] = None
 ):
     """
-    Executes actual Real-ESRGAN neural upscaling with tiled inference to manage RTX 5060 VRAM.
-    Raises RuntimeError if dependencies are not installed.
+    Constructs and returns an instantiated RealESRGANer with verified model architecture,
+    valid weights path, and tiled processing for RTX 5060 VRAM protection.
+    Raises RuntimeError if model weights or modules are unavailable.
     """
     status = check_realesrgan_available()
     if not status["available"]:
         raise RuntimeError(
-            "Real-ESRGAN AI upscaling is not installed on this system. "
-            "Please install Real-ESRGAN (`pip install realesrgan`) and download weights, "
-            "or select 'None (Conventional Scaling)' in the Upscale panel."
+            f"Real-ESRGAN AI upscaling is unavailable: {status.get('error') or 'Dependencies missing.'} "
+            "Please download model weights or select 'None (Conventional Lanczos)'."
+        )
+
+    weights_path = find_model_weights(model_name)
+    if not weights_path:
+        raise RuntimeError(
+            f"Model weights for '{model_name}' ({MODEL_WEIGHTS_MAP.get(model_name)}) "
+            f"not found in {MODELS_DIR} or cache directories."
         )
 
     try:
+        import torch
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
     except ImportError as e:
-        raise RuntimeError(f"Failed to load Real-ESRGAN modules: {e}")
+        raise RuntimeError(f"Failed to import Real-ESRGAN modules: {e}")
 
     scale = 4 if "x4" in model_name else 2
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    use_half = (target_device == "cuda")
 
-    use_half = (device == "cuda")
+    # Valid RRDBNet configuration for RealESRGAN
+    model = RRDBNet(
+        num_in_ch=3,
+        num_out_ch=3,
+        num_feat=64,
+        num_block=23,
+        num_grow_ch=32,
+        scale=scale
+    )
+
     upsampler = RealESRGANer(
         scale=scale,
-        model_path=None,
+        model_path=str(weights_path),
         model=model,
-        tile=tile_size,  # Dynamic VRAM protection for RTX 5060 GDDR7
+        tile=tile_size,       # Tiled inference avoids CUDA OOM on RTX 5060
         tile_pad=10,
         pre_pad=0,
         half=use_half,
-        gpu_id=0 if device == "cuda" else None
+        device=torch.device(target_device)
     )
 
-    output, _ = upsampler.enhance(image_input, outscale=scale)
-    return output
+    return upsampler
+
+def test_realesrgan_inference(model_name: str = "Real-ESRGAN-x4", device: str = "cuda") -> Dict[str, Any]:
+    """
+    Runs actual inference on a synthetic test image to verify CUDA/CPU tensor execution.
+    """
+    try:
+        upsampler = load_realesrgan_upsampler(model_name=model_name, tile_size=256, device=device)
+        dummy_img = np.zeros((32, 32, 3), dtype=np.uint8)
+        dummy_img[8:24, 8:24, :] = 200
+
+        output, _ = upsampler.enhance(dummy_img, outscale=upsampler.scale)
+        return {
+            "success": True,
+            "device": device,
+            "input_shape": dummy_img.shape,
+            "output_shape": output.shape,
+            "scale": upsampler.scale
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "device": device,
+            "error": str(e)
+        }
 
 def build_enhancement_filter_string(enhancement: Dict[str, Any]) -> str:
     """
     Builds conventional FFmpeg filter graph string for color grading, sharpening, and denoising.
-    Only applies conventional Lanczos scaling if target resolution is selected and aiModel is 'None'.
-    Never labels Lanczos scaling or FFmpeg filters as AI upscaling.
+    Applies standard Lanczos scaling ONLY when aiModel is 'None'.
+    Never labels Lanczos scaling as AI upscaling.
     """
     filters = []
 
@@ -107,7 +206,6 @@ def build_enhancement_filter_string(enhancement: Dict[str, Any]) -> str:
         strength = round(denoise * 4.0, 1)
         filters.append(f"hqdn3d={strength}:{strength}:{strength}:{strength}")
 
-    # Conventional scaling is applied only when aiModel is None
     ai_model = enhancement.get("aiModel", "None")
     target_res = enhancement.get("targetResolution") or enhancement.get("upscaleTarget")
     if (not ai_model or ai_model in ["None", "none"]) and target_res:
@@ -137,20 +235,19 @@ def generate_preview_frame(video_path: str, enhancement: Dict[str, Any], timesta
         }
 
     try:
-        temp_dir = Path(video_path).parent
-        orig_frame = temp_dir / "orig_preview.jpg"
-        enh_frame = temp_dir / "enh_preview.jpg"
+        temp_dir = TEMP_DIR
+        preview_id = f"prev_{os.getpid()}"
+        orig_frame = temp_dir / f"{preview_id}_orig.jpg"
+        enh_frame = temp_dir / f"{preview_id}_enh.jpg"
 
-        # Extract original frame
         subprocess.run([
-            ffmpeg, "-y", "-ss", str(timestamp_sec), "-i", str(video_path),
+            ffmpeg, "-y", "-ss", str(timestamp_sec), "-i", str(Path(video_path).resolve()),
             "-vframes", "1", "-q:v", "2", str(orig_frame)
         ], capture_output=True, timeout=10)
 
-        # Extract enhanced frame using conventional FFmpeg filters
         vf_param = filter_string if filter_string != "null" else "null"
         subprocess.run([
-            ffmpeg, "-y", "-ss", str(timestamp_sec), "-i", str(video_path),
+            ffmpeg, "-y", "-ss", str(timestamp_sec), "-i", str(Path(video_path).resolve()),
             "-vf", vf_param, "-vframes", "1", "-q:v", "2", str(enh_frame)
         ], capture_output=True, timeout=10)
 

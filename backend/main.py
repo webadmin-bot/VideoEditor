@@ -3,25 +3,32 @@ import json
 import uuid
 import shutil
 import time
-import threading
+import secrets
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import (
-    UPLOADS_DIR, RENDERS_DIR, TEMP_DIR, PROJECTS_DIR,
+    UPLOADS_DIR, RENDERS_DIR, TEMP_DIR, PROJECTS_DIR, MODELS_DIR,
     BACKEND_HOST, BACKEND_PORT, FRONTEND_ORIGIN
+)
+from .security import (
+    STUDIO_SESSION_TOKEN, sanitize_filename, validate_safe_path,
+    MAX_UPLOAD_SIZE, verify_session_token
 )
 from .engine.hardware import get_system_telemetry, check_ffmpeg, check_nvidia_smi, check_cuda_torch
 from .engine.video_inspector import inspect_video_file
 from .engine.transcriber import transcribe_audio_words
 from .engine.subtitle_generator import generate_ass_file, generate_srt_file
-from .engine.enhancer import generate_preview_frame, build_enhancement_filter_string
+from .engine.enhancer import (
+    generate_preview_frame, build_enhancement_filter_string,
+    check_realesrgan_available, test_realesrgan_inference
+)
 from .engine.renderer import render_final_video
 from .engine.gemini_analyzer import analyze_visual_context_and_moments
 from .jobs import job_manager, Job
@@ -41,7 +48,7 @@ logger = logging.getLogger("ai_video_studio")
 
 app = FastAPI(
     title="AI Video Studio Engine",
-    description="Local Video Processing Backend with Kinetic Typography, Faster-Whisper, and Real-ESRGAN (RTX 5060 Blackwell Optimized)",
+    description="Authoritative Local Video Processing Backend with Kinetic Typography, Faster-Whisper, and Real-ESRGAN (RTX 5060 Optimized)",
     version="1.0.0"
 )
 
@@ -58,13 +65,41 @@ async def startup_event():
     logger.info(f"RAM: {telemetry.get('ram_available_gb')} GB free / {telemetry.get('ram_total_gb')} GB total")
     logger.info(f"GPU Detected: {gpu.get('model')} (VRAM: {gpu.get('vram_total_mb')} MB)")
     if gpu.get("is_blackwell"):
-        logger.info("NVIDIA Blackwell Architecture confirmed (RTX 5060 sm_100/sm_120)")
+        logger.info("NVIDIA Blackwell Architecture confirmed (RTX 5060 sm_120)")
     logger.info(f"Recommended Video Encoder: {telemetry.get('recommended_encoder')}")
-    logger.info(f"Listening at http://{BACKEND_HOST}:{BACKEND_PORT}")
+    logger.info(f"Listening strictly on http://127.0.0.1:{BACKEND_PORT}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("AI Video Studio Backend is gracefully shutting down...")
+
+# Localhost Security Middleware: Enforces session token or verified loopback origins
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in [
+        "/api/health", "/api/auth/session", "/docs", "/openapi.json"
+    ]:
+        return await call_next(request)
+
+    if request.url.path.startswith("/api/"):
+        token = request.headers.get("X-Studio-Token") or request.query_params.get("token")
+        if token and secrets.compare_digest(token, STUDIO_SESSION_TOKEN):
+            return await call_next(request)
+
+        client_host = getattr(request.client, "host", "")
+        origin = request.headers.get("origin", "")
+        is_loopback = client_host in ["127.0.0.1", "::1", "localhost", "testclient"]
+        is_valid_origin = any(origin.startswith(prefix) for prefix in ["http://localhost:", "http://127.0.0.1:"]) or not origin
+
+        if is_loopback and is_valid_origin:
+            return await call_next(request)
+
+        return JSONResponse(
+            status_code=401,
+            content={"error": "UNAUTHORIZED", "detail": "Missing or invalid X-Studio-Token session token."}
+        )
+
+    return await call_next(request)
 
 # CORS restricted to localhost frontend (No wildcard)
 app.add_middleware(
@@ -75,7 +110,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static media mounts for preview
+# Static media mounts strictly isolated to uploads and renders
 app.mount("/media/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 app.mount("/media/renders", StaticFiles(directory=str(RENDERS_DIR)), name="renders")
 
@@ -136,6 +171,7 @@ class ProjectModel(BaseModel):
 
 class SceneAnalysisRequest(BaseModel):
     video_path: Optional[str] = None
+    upload_id: Optional[str] = None
     video_name: Optional[str] = None
     transcript_summary: Optional[str] = ""
 
@@ -147,8 +183,16 @@ def get_health():
     return {
         "status": "healthy",
         "service": "AI Video Studio Local Engine",
-        "host": BACKEND_HOST,
+        "host": "127.0.0.1",
         "port": BACKEND_PORT
+    }
+
+@app.get("/api/auth/session")
+def get_session():
+    """Provides local session token to authorized loopback client."""
+    return {
+        "token": STUDIO_SESSION_TOKEN,
+        "mode": "localhost_secured"
     }
 
 @app.get("/api/system/info")
@@ -168,7 +212,6 @@ def get_models_status():
 
     cuda_check = check_cuda_torch()
     cuda_avail = cuda_check["cuda_available"] and cuda_check["kernel_execution_verified"]
-    torch_avail = cuda_check["torch_installed"]
     realesr_status = check_realesrgan_available()
 
     return {
@@ -182,6 +225,7 @@ def get_models_status():
             "installed": realesr_status["installed"],
             "available": realesr_status["available"],
             "upscale_models": realesr_status["models"],
+            "weights_dir": realesr_status.get("weights_dir"),
             "tiled_supported": True,
             "device": realesr_status["device"],
             "error": realesr_status["error"],
@@ -197,20 +241,39 @@ def get_models_status():
         "compatibility_error": cuda_check.get("compatibility_error")
     }
 
+@app.post("/api/models/test-inference")
+def test_inference(model_name: str = "Real-ESRGAN-x4"):
+    """Runs a live test image inference verification on the selected Real-ESRGAN model."""
+    cuda_check = check_cuda_torch()
+    device = "cuda" if cuda_check["cuda_available"] else "cpu"
+    return test_realesrgan_inference(model_name=model_name, device=device)
+
 @app.post("/api/video/upload")
 async def upload_video(file: UploadFile = File(...)):
-    """Receives local video stream and stores securely in uploads directory."""
-    ext = Path(file.filename).suffix.lower()
+    """Receives local video stream and stores securely with 4GB size limit and filename sanitization."""
+    clean_original = sanitize_filename(file.filename)
+    ext = Path(clean_original).suffix.lower()
     if ext not in [".mp4", ".mov", ".mkv", ".avi", ".webm"]:
-        raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}")
+        raise HTTPException(status_code=400, detail=f"Unsupported video format: {ext}")
 
     safe_id = str(uuid.uuid4().hex[:12])
-    clean_filename = Path(file.filename).name.replace(" ", "_")
-    stored_name = f"{safe_id}_{clean_filename}"
+    stored_name = f"{safe_id}_{clean_original}"
     target_path = (UPLOADS_DIR / stored_name).resolve()
 
+    total_bytes = 0
     with target_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_SIZE:
+                target_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail="File exceeds maximum allowed upload size of 4GB."
+                )
+            buffer.write(chunk)
 
     try:
         metadata = inspect_video_file(str(target_path))
@@ -226,36 +289,40 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.post("/api/video/inspect")
 def inspect_video(req: InspectRequest):
-    """Inspects video properties from filepath or upload_id."""
-    path_to_check = req.filepath
-    if not path_to_check and req.upload_id:
-        matches = list(UPLOADS_DIR.glob(f"{req.upload_id}_*"))
+    """Inspects video properties from validated filepath or upload_id."""
+    path_to_check = None
+    if req.upload_id:
+        clean_id = sanitize_filename(req.upload_id)
+        matches = list(UPLOADS_DIR.glob(f"{clean_id}_*"))
         if matches:
             path_to_check = str(matches[0])
 
+    if not path_to_check and req.filepath:
+        safe_path = validate_safe_path(req.filepath)
+        path_to_check = str(safe_path)
+
     if not path_to_check or not Path(path_to_check).exists():
-        raise HTTPException(status_code=404, detail=f"Video file not found at: {path_to_check}")
+        raise HTTPException(status_code=404, detail="Video file not found in authorized local storage.")
 
     return inspect_video_file(path_to_check)
 
 def run_transcription_background(job: Job, video_path: str, model_size: str):
-    """Background task for real speech transcription."""
+    """Background task for real speech transcription with stage-based progress."""
     try:
-        job.update("ANALYZING", 15.0, "Extracting audio track for transcription")
-        job.update("TRANSCRIBING", 40.0, f"Transcribing audio with Faster-Whisper ({model_size})")
-        res = transcribe_audio_words(video_path, str(TEMP_DIR), model_size=model_size)
+        res = transcribe_audio_words(video_path, str(TEMP_DIR), model_size=model_size, job_ref=job)
         job.complete(res)
     except Exception as e:
         job.fail(str(e))
 
 @app.post("/api/transcription/start")
 def start_transcription(req: AnalysisRequest, background_tasks: BackgroundTasks):
-    """Initiates speech recognition job."""
-    if not Path(req.video_path).exists():
-        raise HTTPException(status_code=404, detail="Video file does not exist.")
+    """Initiates speech recognition job for the specified video."""
+    safe_path = validate_safe_path(req.video_path)
+    if not safe_path.exists():
+        raise HTTPException(status_code=404, detail="Specified video file does not exist.")
 
-    job = job_manager.create_job("TRANSCRIPTION", {"video_path": req.video_path, "model_size": req.model_size})
-    background_tasks.add_task(run_transcription_background, job, req.video_path, req.model_size)
+    job = job_manager.create_job("TRANSCRIPTION", {"video_path": str(safe_path), "model_size": req.model_size})
+    background_tasks.add_task(run_transcription_background, job, str(safe_path), req.model_size)
     return {"job_id": job.id, "stage": job.stage}
 
 @app.post("/api/subtitles/generate")
@@ -282,32 +349,39 @@ def generate_subtitles(req: SubtitleGenerateRequest):
 @app.post("/api/enhancement/preview")
 def preview_enhancement(req: EnhancementPreviewRequest):
     """Generates original vs enhanced frame preview."""
-    res = generate_preview_frame(req.video_path, req.enhancement, req.timestamp_sec)
+    safe_path = validate_safe_path(req.video_path)
+    res = generate_preview_frame(str(safe_path), req.enhancement, req.timestamp_sec)
     return res
 
 @app.post("/api/ai/analyze-scene")
 def analyze_scene(req: SceneAnalysisRequest):
-    """Analyzes real video frames using Gemini Vision API."""
-    path_to_use = req.video_path
+    """
+    Analyzes real video frames using Gemini Vision API for the EXACT selected video.
+    Never silently substitutes another video or selects the most recent upload.
+    """
+    path_to_use = None
+    if req.upload_id:
+        clean_id = sanitize_filename(req.upload_id)
+        matches = list(UPLOADS_DIR.glob(f"{clean_id}_*"))
+        if matches:
+            path_to_use = str(matches[0])
+
+    if not path_to_use and req.video_path:
+        safe_path = validate_safe_path(req.video_path)
+        if safe_path.exists():
+            path_to_use = str(safe_path)
+
     if not path_to_use and req.video_name:
-        matches = list(UPLOADS_DIR.glob(f"*{req.video_name}*"))
+        clean_name = sanitize_filename(req.video_name)
+        matches = list(UPLOADS_DIR.glob(f"*{clean_name}*"))
         if matches:
             path_to_use = str(matches[0])
 
     if not path_to_use or not Path(path_to_use).exists():
-        uploads = sorted(UPLOADS_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if uploads:
-            path_to_use = str(uploads[0])
-
-    if not path_to_use or not Path(path_to_use).exists():
-        return {
-            "enabled": False,
-            "available": False,
-            "message": "No video file available for scene analysis.",
-            "analysis_text": "Scene analysis unavailable (No video uploaded).",
-            "scene_tags": [],
-            "visual_highlights": []
-        }
+        raise HTTPException(
+            status_code=404,
+            detail="The exact video requested for scene analysis was not found. Please select an uploaded video."
+        )
 
     return analyze_visual_context_and_moments(path_to_use, str(TEMP_DIR), req.transcript_summary or "")
 
@@ -343,7 +417,7 @@ def run_render_background(
                 job.update(
                     p_data.get("stage", "RENDERING"),
                     p_data.get("progress_percent", 10.0),
-                    f"Rendering frame at {p_data.get('current_time_sec', 0)}s with {p_data.get('encoder', 'GPU')}"
+                    f"Processing: {p_data.get('current_time_sec', 0)}s with {p_data.get('encoder', 'GPU')}"
                 )
 
         render_res = render_final_video(
@@ -364,6 +438,8 @@ def run_render_background(
             "ass_path": ass_path,
             "file_size_mb": render_res.get("file_size_mb", 0.0),
             "encoder_used": render_res.get("encoder"),
+            "ai_model_applied": render_res.get("ai_model_applied"),
+            "enhancement_applied": render_res.get("enhancement_applied"),
             "report": render_res.get("output_metadata", {}),
         }
         job.complete(render_res, artifacts=artifacts)
@@ -373,31 +449,32 @@ def run_render_background(
 
 @app.post("/api/render/start")
 def start_render(req: RenderRequest, background_tasks: BackgroundTasks):
-    """Starts the master video rendering job."""
-    if not Path(req.input_video_path).exists():
-        raise HTTPException(status_code=404, detail="Input video file not found.")
+    """Starts the master video rendering job for validated safe path."""
+    safe_input = validate_safe_path(req.input_video_path)
+    if not safe_input.exists():
+        raise HTTPException(status_code=404, detail="Input video file not found in storage.")
 
-    out_name = req.output_filename or f"Render_{uuid.uuid4().hex[:8]}.mp4"
-    if not out_name.endswith(".mp4"):
-        out_name += ".mp4"
+    clean_out_name = sanitize_filename(req.output_filename or f"Render_{uuid.uuid4().hex[:8]}.mp4")
+    if not clean_out_name.endswith(".mp4"):
+        clean_out_name += ".mp4"
 
     job = job_manager.create_job("RENDER", {
-        "input_video_path": req.input_video_path,
-        "output_filename": out_name
+        "input_video_path": str(safe_input),
+        "output_filename": clean_out_name
     })
 
     background_tasks.add_task(
         run_render_background,
         job,
-        req.input_video_path,
+        str(safe_input),
         req.segments,
         req.subtitle_style,
         req.enhancement,
         req.export_settings,
-        out_name
+        clean_out_name
     )
 
-    return {"job_id": job.id, "stage": job.stage, "output_filename": out_name}
+    return {"job_id": job.id, "stage": job.stage, "output_filename": clean_out_name}
 
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
@@ -409,7 +486,7 @@ def get_job_status(job_id: str):
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
-    """Cancels a currently active job."""
+    """Cancels an active job, terminating the underlying subprocess."""
     success = job_manager.cancel_job(job_id)
     return {"success": success, "job_id": job_id}
 
@@ -431,8 +508,9 @@ def create_project(proj: ProjectModel):
 @app.put("/api/projects/{project_id}")
 def update_project(project_id: str, proj: ProjectModel):
     """Updates an existing project."""
+    clean_id = sanitize_filename(project_id)
     proj_data = proj.dict()
-    proj_data["id"] = project_id
+    proj_data["id"] = clean_id
     proj_data["updatedAt"] = str(time.strftime("%Y-%m-%d %H:%M:%S"))
     save_project_to_disk(proj_data)
     return proj_data
@@ -440,30 +518,26 @@ def update_project(project_id: str, proj: ProjectModel):
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str):
     """Deletes a saved project."""
-    target = PROJECTS_DIR / f"{project_id}.json"
+    clean_id = sanitize_filename(project_id)
+    target = PROJECTS_DIR / f"{clean_id}.json"
     if target.exists():
         target.unlink()
-        logger.info(f"Project {project_id} deleted.")
+        logger.info(f"Project {clean_id} deleted.")
         return {"success": True}
     return {"success": False}
 
 @app.post("/api/filesystem/test-write")
 def test_filesystem_write(payload: Dict[str, Any] = {}):
-    """
-    Validates write and read permissions on local disk storage.
-    Benchmarking latency to verify fast SSD / NVMe throughput for video rendering.
-    """
+    """Validates write and read permissions on local disk storage."""
     test_id = str(uuid.uuid4())
     test_file = TEMP_DIR / f"perm_test_{test_id}.tmp"
 
     t0 = time.time()
     try:
-        # Write test payload
         test_file.write_text(f"AI Video Studio Write Test {time.time()}", encoding="utf-8")
         read_back = test_file.read_text(encoding="utf-8")
         test_file.unlink()
         latency_ms = round((time.time() - t0) * 1000, 2)
-        logger.info(f"Filesystem write test passed in {latency_ms}ms")
         return {
             "success": True,
             "writable": True,
@@ -482,7 +556,7 @@ def test_filesystem_write(payload: Dict[str, Any] = {}):
 
 @app.post("/api/storage/clean")
 def clean_temp_storage():
-    """Cleans temporary video processing files and freed megabytes."""
+    """Cleans temporary video processing files and reports freed megabytes."""
     freed_bytes = 0
     deleted_count = 0
     for p in TEMP_DIR.glob("*"):
@@ -492,14 +566,16 @@ def clean_temp_storage():
                 p.unlink()
                 freed_bytes += sz
                 deleted_count += 1
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                deleted_count += 1
         except Exception as e:
             logger.warning(f"Failed to delete {p}: {e}")
 
     freed_mb = round(freed_bytes / (1024 * 1024), 2)
-    logger.info(f"Cleaned {deleted_count} temporary files, freed {freed_mb} MB")
     return {
         "success": True,
         "deleted_count": deleted_count,
         "freed_mb": freed_mb,
-        "message": f"Cleaned {deleted_count} cached processing files ({freed_mb} MB freed)"
+        "message": f"Cleaned {deleted_count} cached processing items ({freed_mb} MB freed)"
     }

@@ -4,8 +4,12 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List
+import logging
+
 from ..config import GEMINI_API_KEY
 from .video_inspector import inspect_video_file
+
+logger = logging.getLogger("ai_video_studio.gemini_analyzer")
 
 def analyze_visual_context_and_moments(
     video_path: str,
@@ -16,12 +20,13 @@ def analyze_visual_context_and_moments(
     Analyzes actual representative video frames using Google Gemini API.
     Extracts real frames based on actual video duration, passes the image bytes
     to Gemini 3.8 Flash, and returns genuine observations with exact frame timestamps.
+    Always cleans up temporary frames even if Gemini analysis fails.
     """
     if not GEMINI_API_KEY:
         return {
             "enabled": False,
             "available": False,
-            "message": "Gemini API key is not configured. Visual AI scene analysis is unavailable.",
+            "message": "Gemini API key is not configured in .env. Visual AI scene analysis is unavailable.",
             "analysis_text": "Scene analysis unavailable (Gemini API key missing).",
             "visual_highlights": [],
             "scene_tags": []
@@ -39,6 +44,9 @@ def analyze_visual_context_and_moments(
             "scene_tags": []
         }
 
+    frames_dir = Path(temp_dir) / f"gemini_frames_{os.getpid()}"
+    extracted_items = []
+
     try:
         # Get actual video duration from FFprobe
         meta = inspect_video_file(str(in_path.resolve()))
@@ -47,26 +55,27 @@ def analyze_visual_context_and_moments(
             return {
                 "enabled": False,
                 "available": False,
-                "message": "Video has invalid or zero duration.",
+                "message": "Selected video has invalid or zero duration.",
                 "analysis_text": "Scene analysis unavailable (Zero duration).",
                 "visual_highlights": [],
                 "scene_tags": []
             }
 
-        # Calculate exact frame timestamps based on actual video duration
-        if duration < 2.0:
+        # Calculate exact frame timestamps guaranteed to be strictly within actual video duration
+        if duration < 1.0:
             sample_percentages = [0.5]
-        elif duration < 5.0:
+        elif duration < 4.0:
             sample_percentages = [0.25, 0.75]
         else:
             sample_percentages = [0.20, 0.50, 0.80]
 
-        target_timestamps = [round(duration * p, 2) for p in sample_percentages]
+        target_timestamps = [
+            min(max(0.0, round(duration * p, 2)), max(0.05, duration - 0.05))
+            for p in sample_percentages
+        ]
 
-        frames_dir = Path(temp_dir) / "gemini_frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-        extracted_items = []
         for i, ts in enumerate(target_timestamps):
             out_frame = frames_dir / f"frame_{i}_{ts}s.jpg"
             cmd = [
@@ -78,7 +87,7 @@ def analyze_visual_context_and_moments(
                 "-q:v", "2",
                 str(out_frame)
             ]
-            res = subprocess.run(cmd, capture_output=True, timeout=10)
+            res = subprocess.run(cmd, capture_output=True, timeout=12)
             if res.returncode == 0 and out_frame.exists() and out_frame.stat().st_size > 0:
                 extracted_items.append({
                     "timestamp": ts,
@@ -90,7 +99,7 @@ def analyze_visual_context_and_moments(
             return {
                 "enabled": False,
                 "available": False,
-                "message": "Could not extract representative video frames from video.",
+                "message": "Could not extract representative video frames from the selected video.",
                 "analysis_text": "Scene analysis unavailable (Frame extraction failed).",
                 "visual_highlights": [],
                 "scene_tags": []
@@ -131,14 +140,6 @@ def analyze_visual_context_and_moments(
             contents=contents
         )
 
-        # Cleanup extracted frame files
-        for item in extracted_items:
-            try:
-                if item["path"].exists():
-                    item["path"].unlink()
-            except Exception:
-                pass
-
         resp_text = response.text or ""
         cleaned_json = resp_text.replace("```json", "").replace("```", "").strip()
 
@@ -177,11 +178,17 @@ def analyze_visual_context_and_moments(
             }
 
     except Exception as e:
+        logger.error(f"Gemini scene analysis error: {e}")
         return {
             "enabled": False,
             "available": False,
-            "message": f"Gemini analysis error: {str(e)}",
-            "analysis_text": "Scene analysis unavailable.",
+            "message": f"Gemini Vision API error: {str(e)}",
+            "analysis_text": f"Scene analysis unavailable ({str(e)}).",
             "visual_highlights": [],
             "scene_tags": []
         }
+
+    finally:
+        # Always clean up all extracted temporary frames even if Gemini analysis fails
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)

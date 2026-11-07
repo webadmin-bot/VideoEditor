@@ -36,6 +36,12 @@ class ApiClient {
     return { isPython: false, url: '' };
   }
 
+  private sessionToken = '';
+
+  public setSessionToken(token: string) {
+    this.sessionToken = token;
+  }
+
   public getConnectedStatus(): { isPython: boolean; baseUrl: string } {
     return {
       isPython: this.isConnectedToPython,
@@ -46,12 +52,15 @@ class ApiClient {
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
     const url = `${this.activeBase}${endpoint}`;
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        ...(this.sessionToken ? { 'X-Studio-Token': this.sessionToken } : {}),
+        ...((options.headers as Record<string, string>) || {}),
+      };
+
       const res = await fetch(url, {
         ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          ...(options.headers || {}),
-        },
+        headers,
       });
 
       if (!res.ok) {
@@ -229,7 +238,11 @@ class ApiClient {
     });
   }
 
-  public async analyzeScene(videoPathOrName: string, transcriptSummary: string = ''): Promise<{
+  public async analyzeScene(
+    videoPathOrName: string,
+    transcriptSummary: string = '',
+    uploadId?: string
+  ): Promise<{
     enabled: boolean;
     available?: boolean;
     analysis_text?: string;
@@ -241,6 +254,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({
         video_path: videoPathOrName,
+        upload_id: uploadId,
         video_name: videoPathOrName,
         transcript_summary: transcriptSummary,
       }),
