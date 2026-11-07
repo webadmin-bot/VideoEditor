@@ -252,10 +252,10 @@ export default function App() {
         id: res.job_id,
         job_type: 'TRANSCRIPTION',
         stage: 'QUEUED',
-        progress_percent: 5,
+        progress_percent: 0,
         elapsed_seconds: 0,
-        estimated_remaining_seconds: 10,
-        message: 'Speech transcription job queued',
+        estimated_remaining_seconds: null,
+        message: 'Speech transcription job queued in backend engine',
       });
       showToast('Faster-Whisper speech analysis started', 'info');
     } catch (err: any) {
@@ -296,10 +296,10 @@ export default function App() {
         id: res.job_id,
         job_type: 'RENDER',
         stage: 'QUEUED',
-        progress_percent: 5,
+        progress_percent: 0,
         elapsed_seconds: 0,
-        estimated_remaining_seconds: 15,
-        message: 'Master video render queued',
+        estimated_remaining_seconds: null,
+        message: 'Master video render job queued in backend engine',
       });
       showToast('Render job submitted to engine', 'info');
     } catch (err: any) {

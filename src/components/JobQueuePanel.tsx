@@ -63,7 +63,15 @@ export const JobQueuePanel: React.FC<Props> = ({
       <div className="space-y-1.5">
         <div className="flex justify-between text-xs">
           <span className="text-zinc-400 text-[11px] truncate max-w-[200px]">{activeJob.message}</span>
-          <span className="font-mono text-zinc-200 font-semibold">{activeJob.progress_percent}%</span>
+          <span className="font-mono text-zinc-200 font-semibold">
+            {activeJob.progress_percent > 0
+              ? `${activeJob.progress_percent}%`
+              : isCompleted
+              ? '100%'
+              : isRunning
+              ? 'Active Stage'
+              : '0%'}
+          </span>
         </div>
         <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden">
           <div
@@ -72,9 +80,11 @@ export const JobQueuePanel: React.FC<Props> = ({
                 ? 'bg-emerald-500'
                 : isFailed
                 ? 'bg-red-500'
+                : activeJob.progress_percent <= 0
+                ? 'bg-indigo-500 animate-pulse w-full'
                 : 'bg-gradient-to-r from-indigo-500 to-purple-500'
             }`}
-            style={{ width: `${Math.max(3, activeJob.progress_percent)}%` }}
+            style={activeJob.progress_percent > 0 ? { width: `${activeJob.progress_percent}%` } : undefined}
           />
         </div>
       </div>

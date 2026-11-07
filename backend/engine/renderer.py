@@ -127,6 +127,9 @@ def render_final_video(
     total_duration = max(0.5, float(input_meta.get("duration_seconds", 1.0)))
     source_fps = float(input_meta.get("fps", 30.0))
 
+    src_w = int(input_meta.get("width", 1920))
+    src_h = int(input_meta.get("height", 1080))
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("FFmpeg executable is not available on system PATH.")
@@ -160,6 +163,8 @@ def render_final_video(
     ai_model = enhancement.get("aiModel", "None")
     is_neural_upscale = ai_model and ai_model not in ["None", "none", ""]
     applied_ai_model = None
+    session_id = f"render_{int(time.time())}_{os.getpid()}"
+    trf_path = None
 
     out_file = Path(output_path)
     if out_file.exists():
@@ -168,88 +173,164 @@ def render_final_video(
         except Exception:
             pass
 
-    # ----------------- BRANCH 1: REAL-ESRGAN FRAME-BY-FRAME AI UPSCALING -----------------
-    if is_neural_upscale:
-        realesr_status = check_realesrgan_available()
-        if not realesr_status["available"]:
-            raise RuntimeError(
-                f"AI upscaling requested with model '{ai_model}', but Real-ESRGAN is unavailable: "
-                f"{realesr_status.get('error')}. Please install model weights in storage/models/realesrgan/ "
-                f"or set AI Engine Model to 'None (Conventional Lanczos)'."
-            )
+    # Optional Video Stabilization pass 1 detection
+    if enhancement.get("stabilization", False):
+        trf_file = TEMP_DIR / f"{session_id}_transforms.trf"
+        if progress_callback:
+            progress_callback({"stage": "STABILIZING", "progress_percent": 3.0, "current_time_sec": 0.0, "encoder": codec})
+        stab_cmd = [
+            ffmpeg, "-y",
+            "-i", str(in_file.resolve()),
+            "-vf", f"vidstabdetect=stepsize=6:shakiness=8:accuracy=15:result='{trf_file}'",
+            "-f", "null", "-"
+        ]
+        res = subprocess.run(stab_cmd, capture_output=True, timeout=120)
+        if trf_file.exists():
+            trf_path = trf_file
 
-        applied_ai_model = ai_model
-        tile_size = 512 if enhancement.get("tiledProcessing", True) else 0
-        device = realesr_status["device"]
+    try:
+        # ----------------- BRANCH 1: REAL-ESRGAN FRAME-BY-FRAME AI UPSCALING -----------------
+        if is_neural_upscale:
+            realesr_status = check_realesrgan_available()
+            if not realesr_status["available"]:
+                raise RuntimeError(
+                    f"AI upscaling requested with model '{ai_model}', but Real-ESRGAN is unavailable: "
+                    f"{realesr_status.get('error')}. Please install model weights in storage/models/realesrgan/ "
+                    f"or set AI Engine Model to 'None (Conventional Lanczos)'."
+                )
 
-        logger.info(f"Starting neural frame-by-frame upscaling with {ai_model} (tile={tile_size}, device={device})")
-        upsampler = load_realesrgan_upsampler(model_name=ai_model, tile_size=tile_size, device=device)
+            applied_ai_model = ai_model
+            tile_size = int(enhancement.get("tileSize") or 512) if enhancement.get("tiledProcessing", True) else 0
+            device = realesr_status["device"]
 
-        session_id = f"render_{int(time.time())}_{os.getpid()}"
-        frames_dir = TEMP_DIR / f"{session_id}_raw"
-        upscaled_dir = TEMP_DIR / f"{session_id}_upscaled"
-        temp_audio = TEMP_DIR / f"{session_id}_audio.aac"
+            logger.info(f"Starting neural frame-by-frame upscaling with {ai_model} (tile={tile_size}, device={device})")
+            upsampler = load_realesrgan_upsampler(model_name=ai_model, tile_size=tile_size, device=device)
 
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        upscaled_dir.mkdir(parents=True, exist_ok=True)
+            frames_dir = TEMP_DIR / f"{session_id}_raw"
+            upscaled_dir = TEMP_DIR / f"{session_id}_upscaled"
+            temp_audio = TEMP_DIR / f"{session_id}_audio.aac"
 
-        try:
-            # 1. Extract audio track to preserve synchronization
-            audio_extract_cmd = [
-                ffmpeg, "-y",
-                "-i", str(in_file.resolve()),
-                "-vn",
-                "-c:a", "copy",
-                str(temp_audio)
-            ]
-            has_audio = (subprocess.run(audio_extract_cmd, capture_output=True).returncode == 0 and temp_audio.exists() and temp_audio.stat().st_size > 0)
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            upscaled_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2. Extract video frames as lossless PNGs
-            if progress_callback:
-                progress_callback({"stage": "EXTRACTING_FRAMES", "progress_percent": 2.0, "current_time_sec": 0.0, "encoder": codec})
+            try:
+                # 1. Extract audio track to preserve synchronization
+                audio_extract_cmd = [
+                    ffmpeg, "-y",
+                    "-i", str(in_file.resolve()),
+                    "-vn",
+                    "-c:a", "copy",
+                    str(temp_audio)
+                ]
+                has_audio = (subprocess.run(audio_extract_cmd, capture_output=True).returncode == 0 and temp_audio.exists() and temp_audio.stat().st_size > 0)
 
-            frame_extract_cmd = [
-                ffmpeg, "-y",
-                "-i", str(in_file.resolve()),
-                "-qscale:v", "2",
-                str(frames_dir / "frame_%07d.png")
-            ]
-            ext_res = subprocess.run(frame_extract_cmd, capture_output=True, text=True)
-            if ext_res.returncode != 0:
-                raise RuntimeError(f"FFmpeg frame extraction failed: {ext_res.stderr.strip()[:200]}")
+                # 2. Extract video frames as lossless PNGs
+                if progress_callback:
+                    progress_callback({"stage": "EXTRACTING_FRAMES", "progress_percent": 2.0, "current_time_sec": 0.0, "encoder": codec})
 
-            frame_files = sorted(glob.glob(str(frames_dir / "frame_*.png")))
-            total_frames = len(frame_files)
-            if total_frames == 0:
-                raise RuntimeError("No frames extracted from input video.")
+                frame_extract_cmd = [
+                    ffmpeg, "-y",
+                    "-i", str(in_file.resolve()),
+                    "-qscale:v", "2",
+                    str(frames_dir / "frame_%07d.png")
+                ]
+                ext_res = subprocess.run(frame_extract_cmd, capture_output=True, text=True)
+                if ext_res.returncode != 0:
+                    raise RuntimeError(f"FFmpeg frame extraction failed: {ext_res.stderr.strip()[:200]}")
 
-            # 3. Process frames with RealESRGAN
-            import cv2
-            for idx, f_path in enumerate(frame_files, start=1):
-                if job_ref and getattr(job_ref, "cancelled", False):
-                    raise RuntimeError("Rendering cancelled by user during AI upscaling.")
+                frame_files = sorted(glob.glob(str(frames_dir / "frame_*.png")))
+                total_frames = len(frame_files)
+                if total_frames == 0:
+                    raise RuntimeError("No frames extracted from input video.")
 
-                img = cv2.imread(f_path, cv2.IMREAD_COLOR)
-                if img is None:
-                    continue
+                # 3. Process frames with RealESRGAN
+                import cv2
+                for idx, f_path in enumerate(frame_files, start=1):
+                    if job_ref and getattr(job_ref, "cancelled", False):
+                        raise RuntimeError("Rendering cancelled by user during AI upscaling.")
 
-                output, _ = upsampler.enhance(img, outscale=upsampler.scale)
-                out_frame_path = upscaled_dir / Path(f_path).name
-                cv2.imwrite(str(out_frame_path), output)
+                    img = cv2.imread(f_path, cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
 
-                if idx % 5 == 0 or idx == total_frames:
-                    pct = round(5.0 + (idx / total_frames) * 75.0, 1)
-                    if progress_callback:
-                        progress_callback({
-                            "stage": "AI_UPSCALING",
-                            "progress_percent": pct,
-                            "current_time_sec": round((idx / max(1.0, source_fps)), 1),
-                            "encoder": f"Real-ESRGAN ({ai_model})"
-                        })
+                    output, _ = upsampler.enhance(img, outscale=upsampler.scale)
+                    out_frame_path = upscaled_dir / Path(f_path).name
+                    cv2.imwrite(str(out_frame_path), output)
 
-            # 4. Assemble upscaled frames with FFmpeg, burn subtitles, apply grading filters, and remux audio
+                    if idx % 5 == 0 or idx == total_frames:
+                        pct = round(5.0 + (idx / total_frames) * 75.0, 1)
+                        if progress_callback:
+                            progress_callback({
+                                "stage": "AI_UPSCALING",
+                                "progress_percent": pct,
+                                "current_time_sec": round((idx / max(1.0, source_fps)), 1),
+                                "encoder": f"Real-ESRGAN ({ai_model})"
+                            })
+
+                # 4. Assemble upscaled frames with FFmpeg, burn subtitles, apply grading filters, and remux audio
+                filters = []
+                if trf_path:
+                    filters.append(f"vidstabtransform=input='{trf_path}':smoothing=20:zoom=1")
+
+                enh_filters = build_enhancement_filter_string(enhancement, src_w, src_h)
+                if enh_filters and enh_filters != "null":
+                    filters.append(enh_filters)
+
+                if Path(ass_path).exists():
+                    escaped_ass = str(Path(ass_path).resolve()).replace("\\", "/").replace(":", "\\:")
+                    filters.append(f"ass='{escaped_ass}'")
+
+                assemble_cmd = [
+                    ffmpeg, "-y",
+                    "-framerate", str(source_fps),
+                    "-i", str(upscaled_dir / "frame_%07d.png")
+                ]
+
+                if has_audio:
+                    assemble_cmd.extend(["-i", str(temp_audio)])
+
+                if filters:
+                    assemble_cmd.extend(["-vf", ",".join(filters)])
+
+                assemble_cmd.extend([
+                    "-c:v", codec,
+                    "-r", str(fps),
+                    "-pix_fmt", "yuv420p"
+                ])
+
+                if "nvenc" in codec:
+                    assemble_cmd.extend(["-cq", str(crf)])
+                else:
+                    assemble_cmd.extend(["-crf", str(crf)])
+
+                if has_audio:
+                    assemble_cmd.extend(["-c:a", audio_codec if audio_codec != "copy" else "aac"])
+                else:
+                    assemble_cmd.extend(["-an"])
+
+                assemble_cmd.extend([
+                    "-progress", "pipe:1",
+                    str(out_file.resolve())
+                ])
+
+                run_ffmpeg_with_progress(assemble_cmd, total_duration, codec, progress_callback, job_ref)
+
+            finally:
+                shutil.rmtree(frames_dir, ignore_errors=True)
+                shutil.rmtree(upscaled_dir, ignore_errors=True)
+                if temp_audio.exists():
+                    try:
+                        temp_audio.unlink()
+                    except Exception:
+                        pass
+
+        # ----------------- BRANCH 2: DIRECT HIGH-SPEED FFMPEG FILTER PIPELINE -----------------
+        else:
             filters = []
-            enh_filters = build_enhancement_filter_string(enhancement)
+            if trf_path:
+                filters.append(f"vidstabtransform=input='{trf_path}':smoothing=20:zoom=1")
+
+            enh_filters = build_enhancement_filter_string(enhancement, src_w, src_h)
             if enh_filters and enh_filters != "null":
                 filters.append(enh_filters)
 
@@ -257,66 +338,10 @@ def render_final_video(
                 escaped_ass = str(Path(ass_path).resolve()).replace("\\", "/").replace(":", "\\:")
                 filters.append(f"ass='{escaped_ass}'")
 
-            assemble_cmd = [
+            cmd = [
                 ffmpeg, "-y",
-                "-framerate", str(source_fps),
-                "-i", str(upscaled_dir / "frame_%07d.png")
+                "-i", str(in_file.resolve())
             ]
-
-            if has_audio:
-                assemble_cmd.extend(["-i", str(temp_audio)])
-
-            if filters:
-                assemble_cmd.extend(["-vf", ",".join(filters)])
-
-            assemble_cmd.extend([
-                "-c:v", codec,
-                "-r", str(fps),
-                "-pix_fmt", "yuv420p"
-            ])
-
-            if "nvenc" in codec:
-                assemble_cmd.extend(["-cq", str(crf)])
-            else:
-                assemble_cmd.extend(["-crf", str(crf)])
-
-            if has_audio:
-                assemble_cmd.extend(["-c:a", audio_codec if audio_codec != "copy" else "aac"])
-            else:
-                assemble_cmd.extend(["-an"])
-
-            assemble_cmd.extend([
-                "-progress", "pipe:1",
-                str(out_file.resolve())
-            ])
-
-            run_ffmpeg_with_progress(assemble_cmd, total_duration, codec, progress_callback, job_ref)
-
-        finally:
-            # Clean up all temporary extracted and upscaled frames
-            shutil.rmtree(frames_dir, ignore_errors=True)
-            shutil.rmtree(upscaled_dir, ignore_errors=True)
-            if temp_audio.exists():
-                try:
-                    temp_audio.unlink()
-                except Exception:
-                    pass
-
-    # ----------------- BRANCH 2: DIRECT HIGH-SPEED FFMPEG FILTER PIPELINE -----------------
-    else:
-        filters = []
-        enh_filters = build_enhancement_filter_string(enhancement)
-        if enh_filters and enh_filters != "null":
-            filters.append(enh_filters)
-
-        if Path(ass_path).exists():
-            escaped_ass = str(Path(ass_path).resolve()).replace("\\", "/").replace(":", "\\:")
-            filters.append(f"ass='{escaped_ass}'")
-
-        cmd = [
-            ffmpeg, "-y",
-            "-i", str(in_file.resolve())
-        ]
 
         if filters:
             cmd.extend(["-vf", ",".join(filters)])
@@ -339,6 +364,13 @@ def render_final_video(
         ])
 
         run_ffmpeg_with_progress(cmd, total_duration, codec, progress_callback, job_ref)
+
+    finally:
+        if trf_path and trf_path.exists():
+            try:
+                trf_path.unlink()
+            except Exception:
+                pass
 
     # ----------------- VERIFICATION: PROBE FINAL RENDERED MP4 -----------------
     if not out_file.exists() or out_file.stat().st_size == 0:

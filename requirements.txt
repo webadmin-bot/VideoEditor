@@ -1,4 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cu128
+# General Python Backend Dependencies
+# Note: PyTorch with CUDA 12.8 is installed separately in Step [2/4] of INSTALL.bat
+# to guarantee CUDA 12.8 wheels are pinned and never replaced by CPU wheels.
 
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
@@ -7,12 +9,8 @@ python-multipart>=0.0.9
 psutil>=5.9.8
 google-genai>=0.1.1
 faster-whisper>=1.0.0
-# PyTorch with CUDA 12.8 for RTX 5060 Blackwell (sm_120)
-torch>=2.6.0
-torchvision>=0.21.0
-torchaudio>=2.6.0
-numpy>=1.26.0
+numpy>=1.26.0,<2.0.0
 Pillow>=10.2.0
+opencv-python-headless>=4.9.0
 requests>=2.31.0
 python-dotenv>=1.0.1
-

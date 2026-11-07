@@ -6,3 +6,21 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local Studio Credentials & Storage Artifacts
+storage/.session_token
+storage/uploads/*
+!storage/uploads/.gitkeep
+storage/renders/*
+!storage/renders/.gitkeep
+storage/temp/*
+!storage/temp/.gitkeep
+storage/models/*
+!storage/models/.gitkeep
+
+# Python artifacts & virtual environments
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+

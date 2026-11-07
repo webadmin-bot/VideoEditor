@@ -180,9 +180,14 @@ def test_realesrgan_inference(model_name: str = "Real-ESRGAN-x4", device: str = 
             "error": str(e)
         }
 
-def build_enhancement_filter_string(enhancement: Dict[str, Any]) -> str:
+def build_enhancement_filter_string(
+    enhancement: Dict[str, Any],
+    source_width: int = 1920,
+    source_height: int = 1080
+) -> str:
     """
-    Builds conventional FFmpeg filter graph string for color grading, sharpening, and denoising.
+    Builds conventional FFmpeg filter graph string for color grading, sharpening, denoising,
+    and aspect-ratio-preserving resolution scaling.
     Applies standard Lanczos scaling ONLY when aiModel is 'None'.
     Never labels Lanczos scaling as AI upscaling.
     """
@@ -196,32 +201,50 @@ def build_enhancement_filter_string(enhancement: Dict[str, Any]) -> str:
     if contrast != 1.0 or brightness != 0.0 or saturation != 1.0 or gamma != 1.0:
         filters.append(f"eq=contrast={contrast}:brightness={brightness}:saturation={saturation}:gamma={gamma}")
 
-    sharpen = float(enhancement.get("sharpen", 0.0))
-    if sharpen > 0.0:
-        amount = round(sharpen * 1.5, 2)
+    sharpen_val = float(enhancement.get("sharpenStrength") or enhancement.get("sharpen", 0.0))
+    if sharpen_val > 0.0:
+        amount = round((sharpen_val / 50.0) if sharpen_val > 2.0 else sharpen_val * 1.5, 2)
         filters.append(f"unsharp=5:5:{amount}:5:5:0.0")
 
-    denoise = float(enhancement.get("denoise", 0.0))
-    if denoise > 0.0:
-        strength = round(denoise * 4.0, 1)
-        filters.append(f"hqdn3d={strength}:{strength}:{strength}:{strength}")
+    denoise_val = float(enhancement.get("denoiseStrength") or enhancement.get("denoise", 0.0))
+    if denoise_val > 0.0:
+        strength = round((denoise_val / 10.0) if denoise_val > 5.0 else denoise_val * 4.0, 1)
+        filters.append(f"hqdn3d={strength}:{strength}:4:4")
 
+    # Output Resolution Handling for Landscape & Portrait preserving aspect ratio
     ai_model = enhancement.get("aiModel", "None")
     target_res = enhancement.get("targetResolution") or enhancement.get("upscaleTarget")
-    if (not ai_model or ai_model in ["None", "none"]) and target_res:
+    if (not ai_model or ai_model in ["None", "none"]) and target_res and target_res not in ["None", "none"]:
+        is_portrait = (source_height > source_width)
         if target_res == "1080p":
-            filters.append("scale=1920:1080:flags=lanczos")
+            max_w, max_h = (1080, 1920) if is_portrait else (1920, 1080)
         elif target_res == "2K":
-            filters.append("scale=2560:1440:flags=lanczos")
+            max_w, max_h = (1440, 2560) if is_portrait else (2560, 1440)
         elif target_res == "4K":
-            filters.append("scale=3840:2160:flags=lanczos")
+            max_w, max_h = (2160, 3840) if is_portrait else (3840, 2160)
+        else:
+            max_w, max_h = source_width, source_height
+
+        # Fit within target bounds without stretching, keeping aspect ratio and even dimensions
+        filters.append(f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease:flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
     return ",".join(filters) if filters else "null"
 
 def generate_preview_frame(video_path: str, enhancement: Dict[str, Any], timestamp_sec: float = 1.0) -> Dict[str, Any]:
-    filter_string = build_enhancement_filter_string(enhancement)
     ffmpeg = shutil.which("ffmpeg")
     realesrgan_status = check_realesrgan_available()
+    src_w, src_h = 1920, 1080
+
+    if ffmpeg and Path(video_path).exists():
+        try:
+            from .video_inspector import inspect_video_file
+            meta = inspect_video_file(str(Path(video_path).resolve()))
+            src_w = int(meta.get("width", 1920))
+            src_h = int(meta.get("height", 1080))
+        except Exception:
+            pass
+
+    filter_string = build_enhancement_filter_string(enhancement, src_w, src_h)
 
     if not ffmpeg or not Path(video_path).exists():
         return {

@@ -170,12 +170,44 @@ export const EnhancementPanel: React.FC<Props> = ({
             />
           </label>
 
-          <label className="flex items-center justify-between text-zinc-300 cursor-pointer">
-            <span>CodeFormer Face Restoration</span>
+          {config.tiledProcessing && (
+            <div className="flex items-center justify-between text-zinc-300 pl-4 py-1 text-[11px]">
+              <span className="text-zinc-400">Tile Size (VRAM allocation):</span>
+              <select
+                value={config.tileSize || 512}
+                onChange={(e) => update({ tileSize: parseInt(e.target.value, 10) })}
+                className="bg-zinc-900 border border-zinc-750 text-zinc-200 rounded px-2 py-0.5 text-xs outline-none"
+              >
+                <option value={256}>256x256 (Ultra-Safe / 4GB-6GB)</option>
+                <option value={512}>512x512 (Recommended / RTX 5060 8GB)</option>
+                <option value={1024}>1024x1024 (Fastest / 12GB+ VRAM)</option>
+              </select>
+            </div>
+          )}
+
+          {/* CodeFormer Face Restoration - Disabled since not installed */}
+          <div className="flex items-center justify-between text-zinc-400 opacity-60">
+            <span className="flex items-center gap-1.5">
+              <span>CodeFormer Face Restoration</span>
+              <span className="text-[10px] text-zinc-500 font-mono">(Unavailable — Not Installed)</span>
+            </span>
             <input
               type="checkbox"
-              checked={config.enableFaceRestoration}
-              onChange={(e) => update({ enableFaceRestoration: e.target.checked })}
+              disabled
+              checked={false}
+              className="rounded bg-zinc-900 border-zinc-750 text-zinc-600 cursor-not-allowed"
+            />
+          </div>
+
+          {/* Stabilization Toggle */}
+          <label className="flex items-center justify-between text-zinc-300 cursor-pointer pt-1">
+            <span className="flex items-center gap-1.5">
+              <span>Video Stabilization (FFmpeg vidstab)</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={config.stabilization}
+              onChange={(e) => update({ stabilization: e.target.checked })}
               className="rounded bg-zinc-900 border-zinc-700 text-purple-500 focus:ring-0 cursor-pointer"
             />
           </label>
@@ -201,6 +233,25 @@ export const EnhancementPanel: React.FC<Props> = ({
             step={0.02}
             value={config.contrast}
             onChange={(e) => update({ contrast: parseFloat(e.target.value) })}
+            className="w-full h-1.5 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
+          />
+        </div>
+
+        {/* Brightness Slider */}
+        <div className="space-y-1">
+          <div className="flex justify-between text-zinc-400 text-[11px]">
+            <span>Brightness:</span>
+            <span className="font-mono text-zinc-200">
+              {config.brightness > 0 ? `+${config.brightness.toFixed(2)}` : config.brightness.toFixed(2)}
+            </span>
+          </div>
+          <input
+            type="range"
+            min={-0.3}
+            max={0.3}
+            step={0.01}
+            value={config.brightness}
+            onChange={(e) => update({ brightness: parseFloat(e.target.value) })}
             className="w-full h-1.5 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
           />
         </div>

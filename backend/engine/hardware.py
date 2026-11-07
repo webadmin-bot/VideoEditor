@@ -135,6 +135,43 @@ def check_cuda_torch() -> Dict[str, Any]:
         "compatibility_error": None if kernel_verified or not cuda_available else "GPU kernel execution failed"
     }
 
+def check_ctranslate2_cuda() -> Dict[str, Any]:
+    """
+    Verifies CTranslate2 CUDA support independently of PyTorch.
+    Checks CUDA device availability, cuDNN / cuBLAS libraries, and supported compute types.
+    """
+    installed = False
+    cuda_available = False
+    cuda_device_count = 0
+    supported_compute_types: List[str] = []
+    error = None
+
+    try:
+        import ctranslate2
+        installed = True
+        cuda_device_count = ctranslate2.get_cuda_device_count()
+        cuda_available = cuda_device_count > 0
+        if cuda_available:
+            for c_type in ["float16", "int8_float16", "bfloat16", "int8", "float32"]:
+                try:
+                    if ctranslate2.models.Whisper.is_compute_type_supported("cuda", c_type):
+                        supported_compute_types.append(c_type)
+                except Exception:
+                    pass
+        else:
+            error = "CTranslate2 reports 0 CUDA devices available on this host."
+    except Exception as e:
+        installed = False
+        error = f"CTranslate2 import or CUDA query error: {str(e)}"
+
+    return {
+        "installed": installed,
+        "cuda_available": cuda_available,
+        "cuda_device_count": cuda_device_count,
+        "supported_compute_types": supported_compute_types,
+        "error": error
+    }
+
 def get_system_telemetry() -> Dict[str, Any]:
     total_mem = round(psutil.virtual_memory().total / (1024 ** 3), 1)
     avail_mem = round(psutil.virtual_memory().available / (1024 ** 3), 1)
@@ -142,6 +179,7 @@ def get_system_telemetry() -> Dict[str, Any]:
 
     gpu_info = check_nvidia_smi()
     cuda_info = check_cuda_torch()
+    ctranslate2_info = check_ctranslate2_cuda()
     ffmpeg_info = check_ffmpeg()
 
     is_blackwell = "5060" in gpu_info.get("model", "") or "Blackwell" in gpu_info.get("model", "")
@@ -187,6 +225,7 @@ def get_system_telemetry() -> Dict[str, Any]:
         "ram_percent_used": mem_pct,
         "gpu": gpu_telemetry,
         "cuda": cuda_info,
+        "ctranslate2": ctranslate2_info,
         "ffmpeg": ffmpeg_info,
         "recommended_encoder": recommended_encoder,
         "recommended_upscale_tile": recommended_tile,

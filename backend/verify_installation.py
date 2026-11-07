@@ -33,8 +33,20 @@ def check_pytorch_cuda():
         print(f"  • PyTorch Version: {torch.__version__}")
         print(f"  • PyTorch CUDA Build Version: {torch.version.cuda or 'None (CPU Wheel)'}")
 
+        try:
+            import torchvision
+            print(f"  • TorchVision Version: {torchvision.__version__}")
+        except ImportError:
+            print("  • TorchVision: Not installed")
+
+        try:
+            import torchaudio
+            print(f"  • TorchAudio Version: {torchaudio.__version__}")
+        except ImportError:
+            print("  • TorchAudio: Not installed")
+
         cuda_available = torch.cuda.is_available()
-        print(f"  • CUDA Available: {cuda_available}")
+        print(f"  • PyTorch CUDA Available: {cuda_available}")
 
         if not cuda_available:
             print("\n  [INFO] CUDA is NOT available in this environment.")
@@ -158,7 +170,24 @@ def check_ffmpeg_nvenc():
 def check_ai_subsystems():
     print_header("AI Subsystems & Model Weights Status")
 
-    # 1. Faster-Whisper
+    # 1. Faster-Whisper & CTranslate2 CUDA Verification (Independent of PyTorch)
+    try:
+        import ctranslate2
+        c_count = ctranslate2.get_cuda_device_count()
+        print(f"  • CTranslate2   : Installed (v{getattr(ctranslate2, '__version__', 'unknown')})")
+        print(f"  • CTranslate2 CUDA Devices: {c_count}")
+        if c_count > 0:
+            supported = []
+            for ct in ["float16", "int8_float16", "bfloat16", "int8"]:
+                try:
+                    if ctranslate2.models.Whisper.is_compute_type_supported("cuda", ct):
+                        supported.append(ct)
+                except Exception:
+                    pass
+            print(f"  • CTranslate2 Supported CUDA Types: {', '.join(supported) if supported else 'None'}")
+    except ImportError:
+        print("  • CTranslate2   : Not installed")
+
     try:
         import faster_whisper
         print(f"  • Faster-Whisper : Installed (v{getattr(faster_whisper, '__version__', 'unknown')})")

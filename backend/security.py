@@ -79,7 +79,7 @@ def sanitize_filename(filename: str) -> str:
     clean_name = filename.replace("\\", "/")
     clean_name = os.path.basename(clean_name)
     clean_name = re.sub(r'[\x00-\x1f\\/\:\*\?"<>\|]', '_', clean_name)
-    clean_name = clean_name.replace("..", "_").strip()
+    clean_name = clean_name.replace("..", "_").replace(" ", "_").strip()
     if not clean_name:
         clean_name = f"video_{secrets.token_hex(4)}"
     return clean_name
