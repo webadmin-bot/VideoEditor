@@ -1,0 +1,168 @@
+{
+  "id": "default-project",
+  "name": "My Video Reel",
+  "updatedAt": "2026-11-07T06:41:28.557Z",
+  "videoMetadata": {
+    "filename": "Sample_Presentation_Demonstration.webm",
+    "filepath": "demo_presentation.webm",
+    "file_size_bytes": 331556,
+    "file_size_mb": 0.32,
+    "format_name": "WEBM",
+    "duration_seconds": 8,
+    "width": 1280,
+    "height": 720,
+    "aspect_ratio": "16:9",
+    "fps": 30,
+    "video_codec": "vp8 / avc",
+    "audio_codec": "opus / aac",
+    "audio_channels": 2,
+    "audio_sample_rate": 48000,
+    "bitrate_kbps": 4200,
+    "has_audio": true
+  },
+  "segments": [
+    {
+      "id": "seg-1",
+      "start": 0.5,
+      "end": 3.2,
+      "text": "Experience high-impact kinetic typography animation.",
+      "words": [
+        {
+          "id": "w-1",
+          "word": "Experience",
+          "start": 0.5,
+          "end": 1.1,
+          "confidence": 0.99
+        },
+        {
+          "id": "w-2",
+          "word": "high-impact",
+          "start": 1.15,
+          "end": 1.7,
+          "confidence": 0.98
+        },
+        {
+          "id": "w-3",
+          "word": "kinetic",
+          "start": 1.75,
+          "end": 2.2,
+          "confidence": 0.99
+        },
+        {
+          "id": "w-4",
+          "word": "typography",
+          "start": 2.25,
+          "end": 2.8,
+          "confidence": 0.97
+        },
+        {
+          "id": "w-5",
+          "word": "animation.",
+          "start": 2.85,
+          "end": 3.2,
+          "confidence": 0.98
+        }
+      ]
+    },
+    {
+      "id": "seg-2",
+      "start": 3.6,
+      "end": 6.8,
+      "text": "Powered by Faster-Whisper and local GPU upscaling.",
+      "words": [
+        {
+          "id": "w-6",
+          "word": "Powered",
+          "start": 3.6,
+          "end": 4,
+          "confidence": 0.98
+        },
+        {
+          "id": "w-7",
+          "word": "by",
+          "start": 4.05,
+          "end": 4.25,
+          "confidence": 0.99
+        },
+        {
+          "id": "w-8",
+          "word": "Faster-Whisper",
+          "start": 4.3,
+          "end": 5.1,
+          "confidence": 0.96
+        },
+        {
+          "id": "w-9",
+          "word": "and",
+          "start": 5.15,
+          "end": 5.35,
+          "confidence": 0.98
+        },
+        {
+          "id": "w-10",
+          "word": "local",
+          "start": 5.4,
+          "end": 5.75,
+          "confidence": 0.97
+        },
+        {
+          "id": "w-11",
+          "word": "GPU",
+          "start": 5.8,
+          "end": 6.15,
+          "confidence": 0.99
+        },
+        {
+          "id": "w-12",
+          "word": "upscaling.",
+          "start": 6.2,
+          "end": 6.8,
+          "confidence": 0.97
+        }
+      ]
+    }
+  ],
+  "subtitleStyle": {
+    "mode": "kinetic-word",
+    "fontFamily": "Montserrat, Arial, sans-serif",
+    "fontSize": 32,
+    "fontWeight": "800",
+    "textColor": "#FFFFFF",
+    "highlightColor": "#F59E0B",
+    "outlineColor": "#000000",
+    "outlineWidth": 3,
+    "shadowColor": "#000000",
+    "shadowDepth": 2,
+    "backgroundColor": "#000000",
+    "backgroundOpacity": 0.3,
+    "position": "bottom",
+    "verticalMargin": 60,
+    "maxWordsPerLine": 5,
+    "glowEffect": true,
+    "popAnimation": true,
+    "animationDurationMs": 120
+  },
+  "enhancement": {
+    "preset": "Natural",
+    "upscaleTarget": "1080p",
+    "aiModel": "Real-ESRGAN-x2",
+    "enableFaceRestoration": false,
+    "tiledProcessing": true,
+    "tileSize": 512,
+    "denoiseStrength": 15,
+    "sharpenStrength": 20,
+    "contrast": 1.05,
+    "saturation": 1.05,
+    "brightness": 0,
+    "stabilization": false
+  },
+  "exportSettings": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "videoCodec": "auto",
+    "audioCodec": "copy",
+    "qualityCrf": 20,
+    "outputFilename": "AI_Video_Studio_Export.mp4"
+  }
+}

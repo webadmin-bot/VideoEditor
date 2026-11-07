@@ -1,0 +1,27 @@
+# AI Video Studio - Local Python Backend Requirements
+# Optimized for Windows 10/11 with NVIDIA GeForce RTX 5060 (Blackwell Architecture) & CPU Fallback
+
+fastapi>=0.110.0,<0.120.0
+uvicorn[standard]>=0.28.0,<0.32.0
+pydantic>=2.6.0,<3.0.0
+python-multipart>=0.0.9
+opencv-python-headless>=4.9.0.80
+numpy>=1.26.0,<2.0.0
+psutil>=5.9.8
+python-dotenv>=1.0.1
+websockets>=12.0
+requests>=2.31.0
+
+# Speech-to-Text & Word-level Alignment (CUDA 12 / cuDNN 9)
+faster-whisper>=1.0.0
+ctranslate2>=4.4.0
+
+# PyTorch & Neural Upscaling for NVIDIA GeForce RTX 5060 (Blackwell sm_100/sm_120)
+# RTX 5060 requires PyTorch 2.6+ with CUDA 12.8 / 12.6 and NVIDIA Driver >= 570.xx
+# Install via: pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.6.0
+torchvision>=0.21.0
+
+# Optional Google Gemini Visual Keyframe Analysis
+google-genai>=2.4.0
+

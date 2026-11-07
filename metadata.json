@@ -1,0 +1,7 @@
+{
+  "name": "AI Video Studio",
+  "description": "Professional local AI video production studio with kinetic typography, Whisper transcription, Real-ESRGAN upscaling, and GPU-accelerated rendering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
