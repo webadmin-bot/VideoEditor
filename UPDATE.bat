@@ -1,31 +1,22 @@
 @echo off
-setlocal
-title AI Video Studio - Update Script
-color 0E
+setlocal enabledelayedexpansion
 
-echo =====================================================================
-echo                     AI VIDEO STUDIO - UPDATER
-echo =====================================================================
+echo ========================================================
+echo       UPDATING AI VIDEO STUDIO DEPENDENCIES
+echo ========================================================
 echo.
-
-git --version >nul 2>&1
-if %ERRORLEVEL% equ 0 (
-    echo Pulling latest code changes...
-    git pull
-)
 
 if exist "venv\Scripts\activate.bat" (
     call venv\Scripts\activate.bat
+    echo Updating PyTorch with CUDA 12.8 (RTX 5060 Blackwell support)...
+    python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+    echo Updating Python packages...
+    python -m pip install --upgrade -r requirements.txt
 )
 
-echo Updating Python dependencies...
-pip install --upgrade -r requirements.txt
-
-echo Updating Node dependencies...
-call npm install
+echo Updating npm packages...
+call npm update
 
 echo.
-echo =====================================================================
-echo  UPDATE COMPLETE!
-echo =====================================================================
+echo All components updated.
 pause

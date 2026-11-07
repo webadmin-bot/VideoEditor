@@ -1,71 +1,65 @@
 @echo off
 setlocal enabledelayedexpansion
-title AI Video Studio - Windows Installation Script
-color 0A
 
-echo =====================================================================
-echo               AI VIDEO STUDIO - ONE-CLICK INSTALLATION
-echo =====================================================================
+echo ========================================================
+echo       AI VIDEO STUDIO — ONE-CLICK INSTALLER (WINDOWS)
+echo ========================================================
 echo.
 
-:: 1. Check Python
+:: Check Python
 python --version >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo [ERROR] Python 3 is not installed or not in your PATH.
-    echo Please install Python 3.10+ from python.org and check "Add Python to PATH".
+    echo [ERROR] Python is not found in system PATH.
+    echo Please install Python 3.10 or 3.11 from https://www.python.org/
+    echo Make sure to check "Add Python to PATH" during installation.
     pause
     exit /b 1
 )
 
-:: 2. Check Node
-node -v >nul 2>&1
+:: Check Node.js
+node --version >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo [ERROR] Node.js is not installed or not in your PATH.
-    echo Please install Node.js LTS from nodejs.org.
+    echo [ERROR] Node.js is not found in system PATH.
+    echo Please install Node.js 20+ from https://nodejs.org/
     pause
     exit /b 1
 )
 
-:: 3. Create Virtualenv if needed
-echo Setting up Python virtual environment...
+echo [1/4] Creating Python Virtual Environment (venv)...
 if not exist "venv" (
     python -m venv venv
 )
 call venv\Scripts\activate.bat
 
-:: 4. Install Python Dependencies
-echo.
-echo Installing Python packages from requirements.txt...
-pip install --upgrade pip
-pip install -r requirements.txt
-
-echo.
-echo Installing PyTorch 2.6+ with CUDA 12.8 (Blackwell RTX 5060 Optimized)...
-pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-:: 5. Install Node Dependencies
-echo.
-echo Installing Node.js frontend dependencies...
-call npm install
-
-:: 6. Check FFmpeg
-echo.
-ffmpeg -version >nul 2>&1
+echo [2/4] Upgrading pip and installing PyTorch with CUDA 12.8 (RTX 5060 Blackwell Support)...
+python -m pip install --upgrade pip
+echo Installing PyTorch with CUDA 12.8 for NVIDIA GeForce RTX 5060 (sm_120 / Blackwell)...
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 if %ERRORLEVEL% neq 0 (
-    echo [ATTENTION] FFmpeg is not found in your System PATH.
-    echo To render finished MP4 videos and burn kinetic subtitles, FFmpeg is required.
-    echo Quick setup:
-    echo 1. Download: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
-    echo 2. Extract to C:\ffmpeg
-    echo 3. Add C:\ffmpeg\bin to your Windows Environment PATH.
-) else (
-    echo FFmpeg is verified and ready!
+    echo.
+    echo [NOTICE] CUDA 12.8 wheel repository not reachable, attempting CUDA 12.6 wheel fallback...
+    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 )
 
+echo Verifying PyTorch CUDA installation...
+python -c "import torch; print(f'[INFO] PyTorch version: {torch.__version__} | CUDA Available: {torch.cuda.is_available()} | Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None (CPU)\"}')"
+
+echo [3/4] Installing Python Backend dependencies (preserving CUDA 12.8)...
+python -m pip install -r requirements.txt
+
 echo.
-echo =====================================================================
-echo  INSTALLATION COMPLETE!
-echo  Run START_AI_VIDEO_STUDIO.bat to launch the application.
-echo =====================================================================
+echo Verifying installation, CUDA tensor execution, and hardware encoders...
+python backend/verify_installation.py
+
+echo.
+echo [4/4] Installing Node.js Frontend dependencies...
+call npm install
+
+echo.
+echo ========================================================
+echo       INSTALLATION AND VERIFICATION COMPLETED
+echo ========================================================
+echo Run START_AI_VIDEO_STUDIO.bat to launch the application.
 echo.
 pause
+

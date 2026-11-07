@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import shutil
+import time
 import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -65,12 +66,12 @@ async def startup_event():
 async def shutdown_event():
     logger.info("AI Video Studio Backend is gracefully shutting down...")
 
-# CORS restricted to localhost frontend
+# CORS restricted to localhost frontend (No wildcard)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -133,6 +134,11 @@ class ProjectModel(BaseModel):
     subtitle_style: Optional[Dict[str, Any]] = None
     enhancement: Optional[Dict[str, Any]] = None
 
+class SceneAnalysisRequest(BaseModel):
+    video_path: Optional[str] = None
+    video_name: Optional[str] = None
+    transcript_summary: Optional[str] = ""
+
 # ----------------- Endpoints -----------------
 
 @app.get("/api/health")
@@ -163,6 +169,7 @@ def get_models_status():
     cuda_check = check_cuda_torch()
     cuda_avail = cuda_check["cuda_available"] and cuda_check["kernel_execution_verified"]
     torch_avail = cuda_check["torch_installed"]
+    realesr_status = check_realesrgan_available()
 
     return {
         "faster_whisper": {
@@ -172,16 +179,18 @@ def get_models_status():
             "compute_type": "float16" if cuda_avail else "int8"
         },
         "real_esrgan": {
-            "installed": torch_avail,
-            "upscale_models": ["Real-ESRGAN-x2", "Real-ESRGAN-x4"],
+            "installed": realesr_status["installed"],
+            "available": realesr_status["available"],
+            "upscale_models": realesr_status["models"],
             "tiled_supported": True,
-            "device": "cuda" if cuda_avail else "cpu",
+            "device": realesr_status["device"],
+            "error": realesr_status["error"],
             "kernel_verified": cuda_check.get("kernel_execution_verified", False)
         },
         "codeformer": {
-            "installed": torch_avail,
-            "available": True,
-            "device": "cuda" if cuda_avail else "cpu"
+            "installed": False,
+            "available": False,
+            "device": "cpu"
         },
         "cuda_acceleration": cuda_avail,
         "compute_capability": cuda_check.get("compute_capability"),
@@ -195,15 +204,23 @@ async def upload_video(file: UploadFile = File(...)):
     if ext not in [".mp4", ".mov", ".mkv", ".avi", ".webm"]:
         raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}")
 
-    safe_id = str(uuid.uuid4())
-    stored_name = f"{safe_id}_{file.filename}"
-    target_path = UPLOADS_DIR / stored_name
+    safe_id = str(uuid.uuid4().hex[:12])
+    clean_filename = Path(file.filename).name.replace(" ", "_")
+    stored_name = f"{safe_id}_{clean_filename}"
+    target_path = (UPLOADS_DIR / stored_name).resolve()
 
     with target_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    metadata = inspect_video_file(str(target_path))
+    try:
+        metadata = inspect_video_file(str(target_path))
+    except Exception as e:
+        if target_path.exists():
+            target_path.unlink()
+        raise HTTPException(status_code=422, detail=f"FFprobe inspection failed: {str(e)}")
+
     metadata["upload_id"] = safe_id
+    metadata["filepath"] = str(target_path)
     metadata["media_url"] = f"/media/uploads/{stored_name}"
     return metadata
 
@@ -217,23 +234,16 @@ def inspect_video(req: InspectRequest):
             path_to_check = str(matches[0])
 
     if not path_to_check or not Path(path_to_check).exists():
-        raise HTTPException(status_code=404, detail="Video file not found.")
+        raise HTTPException(status_code=404, detail=f"Video file not found at: {path_to_check}")
 
     return inspect_video_file(path_to_check)
 
 def run_transcription_background(job: Job, video_path: str, model_size: str):
-    """Background task for speech transcription."""
+    """Background task for real speech transcription."""
     try:
-        job.update("VALIDATING", 10.0, "Validating video and audio stream")
-        time.sleep(0.3)
-        job.update("ANALYZING", 25.0, "Extracting audio track for transcription")
-        
-        job.update("TRANSCRIBING", 50.0, f"Transcribing audio with Faster-Whisper ({model_size})")
+        job.update("ANALYZING", 15.0, "Extracting audio track for transcription")
+        job.update("TRANSCRIBING", 40.0, f"Transcribing audio with Faster-Whisper ({model_size})")
         res = transcribe_audio_words(video_path, str(TEMP_DIR), model_size=model_size)
-
-        job.update("ALIGNING", 85.0, "Aligning word-level timestamps")
-        time.sleep(0.2)
-
         job.complete(res)
     except Exception as e:
         job.fail(str(e))
@@ -275,6 +285,32 @@ def preview_enhancement(req: EnhancementPreviewRequest):
     res = generate_preview_frame(req.video_path, req.enhancement, req.timestamp_sec)
     return res
 
+@app.post("/api/ai/analyze-scene")
+def analyze_scene(req: SceneAnalysisRequest):
+    """Analyzes real video frames using Gemini Vision API."""
+    path_to_use = req.video_path
+    if not path_to_use and req.video_name:
+        matches = list(UPLOADS_DIR.glob(f"*{req.video_name}*"))
+        if matches:
+            path_to_use = str(matches[0])
+
+    if not path_to_use or not Path(path_to_use).exists():
+        uploads = sorted(UPLOADS_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if uploads:
+            path_to_use = str(uploads[0])
+
+    if not path_to_use or not Path(path_to_use).exists():
+        return {
+            "enabled": False,
+            "available": False,
+            "message": "No video file available for scene analysis.",
+            "analysis_text": "Scene analysis unavailable (No video uploaded).",
+            "scene_tags": [],
+            "visual_highlights": []
+        }
+
+    return analyze_visual_context_and_moments(path_to_use, str(TEMP_DIR), req.transcript_summary or "")
+
 def run_render_background(
     job: Job,
     input_path: str,
@@ -286,13 +322,10 @@ def run_render_background(
 ):
     """Complete multi-stage video rendering pipeline."""
     try:
-        job.update("VALIDATING", 5.0, "Validating parameters and hardware encoders")
-        
-        # 1. Generate kinetic ASS subtitle file
-        job.update("GENERATING_SUBTITLES", 15.0, "Compiling kinetic typography script")
+        job.update("GENERATING_SUBTITLES", 5.0, "Compiling kinetic typography script")
         ass_path = str(TEMP_DIR / f"{job.id}_subtitles.ass")
         srt_path = str(RENDERS_DIR / f"{Path(output_filename).stem}.srt")
-        
+
         generate_ass_file(
             segments,
             subtitle_style,
@@ -302,15 +335,14 @@ def run_render_background(
         )
         generate_srt_file(segments, srt_path)
 
-        # 2. Rendering with FFmpeg
         out_path = str(RENDERS_DIR / output_filename)
-        job.update("RENDERING", 25.0, "Encoding video frames with FFmpeg")
+        job.update("RENDERING", 10.0, "Encoding video frames with FFmpeg")
 
         def on_progress(p_data: Dict[str, Any]):
             if not job.cancelled:
                 job.update(
                     p_data.get("stage", "RENDERING"),
-                    25.0 + (p_data.get("progress_percent", 0.0) * 0.7),
+                    p_data.get("progress_percent", 10.0),
                     f"Rendering frame at {p_data.get('current_time_sec', 0)}s with {p_data.get('encoder', 'GPU')}"
                 )
 
@@ -320,18 +352,19 @@ def run_render_background(
             ass_path,
             enhancement,
             export_settings,
-            progress_callback=on_progress
+            progress_callback=on_progress,
+            job_ref=job
         )
-
-        job.update("VALIDATING_OUTPUT", 98.0, "Verifying rendered stream integrity")
-        time.sleep(0.5)
 
         artifacts = {
             "video_url": f"/media/renders/{output_filename}",
+            "video_filename": output_filename,
             "video_path": out_path,
             "srt_path": srt_path,
             "ass_path": ass_path,
             "file_size_mb": render_res.get("file_size_mb", 0.0),
+            "encoder_used": render_res.get("encoder"),
+            "report": render_res.get("output_metadata", {}),
         }
         job.complete(render_res, artifacts=artifacts)
 
@@ -420,7 +453,6 @@ def test_filesystem_write(payload: Dict[str, Any] = {}):
     Validates write and read permissions on local disk storage.
     Benchmarking latency to verify fast SSD / NVMe throughput for video rendering.
     """
-    import time
     test_id = str(uuid.uuid4())
     test_file = TEMP_DIR / f"perm_test_{test_id}.tmp"
 
@@ -471,4 +503,3 @@ def clean_temp_storage():
         "freed_mb": freed_mb,
         "message": f"Cleaned {deleted_count} cached processing files ({freed_mb} MB freed)"
     }
-

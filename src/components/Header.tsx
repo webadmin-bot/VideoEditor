@@ -13,6 +13,7 @@ interface Props {
   onOpenSettings: () => void;
   telemetry: HardwareTelemetry | null;
   isPythonEngine: boolean;
+  isBackendConnected: boolean | null;
   isSaving: boolean;
 }
 
@@ -27,6 +28,7 @@ export const Header: React.FC<Props> = ({
   onOpenSettings,
   telemetry,
   isPythonEngine,
+  isBackendConnected,
   isSaving,
 }) => {
   return (
@@ -91,17 +93,19 @@ export const Header: React.FC<Props> = ({
           <span className="relative flex h-2 w-2">
             <span
               className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                isPythonEngine ? 'bg-emerald-400' : 'bg-blue-400'
+                isBackendConnected ? 'bg-emerald-400' : 'bg-red-400'
               }`}
             />
             <span
               className={`relative inline-flex rounded-full h-2 w-2 ${
-                isPythonEngine ? 'bg-emerald-500' : 'bg-blue-500'
+                isBackendConnected ? 'bg-emerald-500' : 'bg-red-500'
               }`}
             />
           </span>
-          <span className="text-zinc-300 font-mono text-[11px]">
-            {isPythonEngine ? 'Python Engine (8000)' : 'Local Engine (3000)'}
+          <span className={`font-mono text-[11px] ${isBackendConnected ? 'text-zinc-300' : 'text-red-400 font-semibold'}`}>
+            {isBackendConnected
+              ? (isPythonEngine ? 'Python Engine (8000)' : 'Backend Connected')
+              : 'Backend Offline (503)'}
           </span>
         </div>
 

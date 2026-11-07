@@ -3,8 +3,6 @@ import { SubtitleSegment, SubtitleStyleConfig } from '../utils/subtitleParser';
 import { EnhancementConfig } from '../utils/enhancementEngine';
 
 class ApiClient {
-  private primaryUrl = 'http://127.0.0.1:8000';
-  private fallbackUrl = '';
   private activeBase = '';
   private isConnectedToPython = false;
 
@@ -17,30 +15,31 @@ class ApiClient {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 1200);
 
-      const res = await fetch(`${this.primaryUrl}/api/health`, {
+      const res = await fetch('/api/health', {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
       clearTimeout(timeoutId);
 
       if (res.ok) {
-        this.activeBase = this.primaryUrl;
+        const data = await res.json();
         this.isConnectedToPython = true;
-        return { isPython: true, url: this.primaryUrl };
+        this.activeBase = '';
+        return { isPython: true, url: typeof window !== 'undefined' ? window.location.origin : '' };
       }
     } catch {
-      // Python backend not reachable on 8000, fallback to Vite/Express proxy on same origin
+      // Backend offline or unreachable
     }
 
-    this.activeBase = this.fallbackUrl;
+    this.activeBase = '';
     this.isConnectedToPython = false;
-    return { isPython: false, url: window.location.origin };
+    return { isPython: false, url: '' };
   }
 
   public getConnectedStatus(): { isPython: boolean; baseUrl: string } {
     return {
       isPython: this.isConnectedToPython,
-      baseUrl: this.activeBase || window.location.origin,
+      baseUrl: this.activeBase || (typeof window !== 'undefined' ? window.location.origin : ''),
     };
   }
 
@@ -62,12 +61,6 @@ class ApiClient {
 
       return (await res.json()) as T;
     } catch (err: any) {
-      // If primary failed, try fallback
-      if (this.activeBase === this.primaryUrl) {
-        this.activeBase = this.fallbackUrl;
-        this.isConnectedToPython = false;
-        return this.request<T>(endpoint, options);
-      }
       throw err;
     }
   }
@@ -82,6 +75,33 @@ class ApiClient {
 
   public async getModelsStatus(): Promise<any> {
     return this.request('/api/models/status');
+  }
+
+  public getBaseUrl(): string {
+    return this.activeBase || (typeof window !== 'undefined' ? window.location.origin : '');
+  }
+
+  public async uploadVideo(file: File): Promise<VideoMetadata> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const url = `${this.activeBase}/api/video/upload`;
+    const res = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      let errDetail = errorText;
+      try {
+        const parsed = JSON.parse(errorText);
+        errDetail = parsed.detail || parsed.error || errorText;
+      } catch {}
+      throw new Error(`Upload Failed (${res.status}): ${errDetail}`);
+    }
+
+    return (await res.json()) as VideoMetadata;
   }
 
   public async inspectVideo(payload: {
@@ -206,6 +226,24 @@ class ApiClient {
   }> {
     return this.request('/api/storage/clean', {
       method: 'POST',
+    });
+  }
+
+  public async analyzeScene(videoPathOrName: string, transcriptSummary: string = ''): Promise<{
+    enabled: boolean;
+    available?: boolean;
+    analysis_text?: string;
+    scene_tags: string[];
+    visual_highlights: Array<{ timestamp: number; title: string; description: string }>;
+    message?: string;
+  }> {
+    return this.request('/api/ai/analyze-scene', {
+      method: 'POST',
+      body: JSON.stringify({
+        video_path: videoPathOrName,
+        video_name: videoPathOrName,
+        transcript_summary: transcriptSummary,
+      }),
     });
   }
 }

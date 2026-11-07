@@ -30,7 +30,8 @@ import {
   EnhancementConfig, DEFAULT_ENHANCEMENT
 } from './utils/enhancementEngine';
 import {
-  pickVideoFile, pickOutputDirectory, saveRenderToDirectory, DirectoryHandleState
+  pickVideoFile, pickOutputDirectory, saveRenderToDirectory, DirectoryHandleState,
+  isDirectoryPickerSupported, verifyPermission
 } from './utils/fileSystemAccess';
 
 import {
@@ -54,37 +55,8 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [duration, setDuration] = useState<number>(10.0);
 
-  // Subtitle state
-  const [segments, setSegments] = useState<SubtitleSegment[]>([
-    {
-      id: 'seg-1',
-      start: 0.5,
-      end: 3.2,
-      text: 'Experience high-impact kinetic typography animation.',
-      words: [
-        { id: 'w-1', word: 'Experience', start: 0.5, end: 1.1, confidence: 0.99 },
-        { id: 'w-2', word: 'high-impact', start: 1.15, end: 1.7, confidence: 0.98 },
-        { id: 'w-3', word: 'kinetic', start: 1.75, end: 2.2, confidence: 0.99 },
-        { id: 'w-4', word: 'typography', start: 2.25, end: 2.8, confidence: 0.97 },
-        { id: 'w-5', word: 'animation.', start: 2.85, end: 3.2, confidence: 0.98 },
-      ],
-    },
-    {
-      id: 'seg-2',
-      start: 3.6,
-      end: 6.8,
-      text: 'Powered by Faster-Whisper and local GPU upscaling.',
-      words: [
-        { id: 'w-6', word: 'Powered', start: 3.6, end: 4.0, confidence: 0.98 },
-        { id: 'w-7', word: 'by', start: 4.05, end: 4.25, confidence: 0.99 },
-        { id: 'w-8', word: 'Faster-Whisper', start: 4.3, end: 5.1, confidence: 0.96 },
-        { id: 'w-9', word: 'and', start: 5.15, end: 5.35, confidence: 0.98 },
-        { id: 'w-10', word: 'local', start: 5.4, end: 5.75, confidence: 0.97 },
-        { id: 'w-11', word: 'GPU', start: 5.8, end: 6.15, confidence: 0.99 },
-        { id: 'w-12', word: 'upscaling.', start: 6.2, end: 6.8, confidence: 0.97 },
-      ],
-    },
-  ]);
+  // Subtitle state (real transcribed segments, no fake demo words)
+  const [segments, setSegments] = useState<SubtitleSegment[]>([]);
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleConfig>(DEFAULT_SUBTITLE_STYLE);
 
   // Enhancement state
@@ -116,6 +88,7 @@ export default function App() {
   // System & Connection state
   const [telemetry, setTelemetry] = useState<HardwareTelemetry | null>(null);
   const [isPythonEngine, setIsPythonEngine] = useState(false);
+  const [isBackendConnected, setIsBackendConnected] = useState<boolean | null>(null);
   const [isTelemetryLoading, setIsTelemetryLoading] = useState(false);
 
   // Modals state
@@ -144,53 +117,51 @@ export default function App() {
     showToast(`Loaded project: ${proj.name}`, 'success');
   };
 
-  const handleFileDrop = async (file: File) => {
+  const processUploadedVideo = async (file: File) => {
     setVideoFile(file);
     const url = URL.createObjectURL(file);
     setVideoSrc(url);
 
+    showToast(`Uploading ${file.name} to local engine...`, 'info');
     try {
-      const meta = await apiClient.inspectVideo({
-        filename: file.name,
-        size: file.size,
-        width: 1920,
-        height: 1080,
-        duration: 10.0,
-      });
+      const meta = await apiClient.uploadVideo(file);
       setVideoMetadata(meta);
+      if (meta.duration_seconds) {
+        setDuration(meta.duration_seconds);
+      }
       setExportSettings((prev) => ({
         ...prev,
+        width: meta.width || prev.width,
+        height: meta.height || prev.height,
+        fps: meta.fps ? Math.round(meta.fps) : prev.fps,
         outputFilename: `${file.name.replace(/\.[^/.]+$/, '')}_Rendered.mp4`,
       }));
-    } catch {
-      setVideoMetadata({
-        filename: file.name,
-        filepath: file.name,
-        file_size_bytes: file.size,
-        file_size_mb: Math.round((file.size / (1024 * 1024)) * 100) / 100,
-        format_name: file.name.split('.').pop()?.toUpperCase() || 'MP4',
-        duration_seconds: 10.0,
-        width: 1920,
-        height: 1080,
-        aspect_ratio: '16:9',
-        fps: 30,
-        video_codec: 'h264',
-        audio_codec: 'aac',
-        audio_channels: 2,
-        audio_sample_rate: 44100,
-        bitrate_kbps: 4500,
-        has_audio: true,
-      });
+      showToast(`Uploaded & inspected ${file.name} successfully`, 'success');
+    } catch (err: any) {
+      setVideoMetadata(null);
+      showToast(`Upload/inspection failed: ${err.message}`, 'error');
     }
+  };
 
-    showToast(`Loaded ${file.name} successfully`, 'success');
+  const handleFileDrop = async (file: File) => {
+    await processUploadedVideo(file);
+  };
+
+  // Handle local video selection
+  const handleSelectVideo = async () => {
+    try {
+      const { file } = await pickVideoFile();
+      await processUploadedVideo(file);
+    } catch (err: any) {
+      if (err.message !== 'Selection cancelled') {
+        showToast(err.message || 'Failed to select video', 'error');
+      }
+    }
   };
 
   // Initial detection
   useEffect(() => {
     loadHardwareInfo();
-    // Preload sample video if none present so user can test immediate playback
-    createDemoVideoBlob();
   }, []);
 
   // Poll active job status
@@ -237,164 +208,14 @@ export default function App() {
       setIsPythonEngine(detect.isPython);
       const data = await apiClient.getSystemInfo();
       setTelemetry(data);
-    } catch {
-      // Backend not yet ready
+      setIsBackendConnected(true);
+    } catch (err: any) {
+      console.warn('Backend connection error:', err);
+      setIsBackendConnected(false);
+      setIsPythonEngine(false);
+      setTelemetry(null);
     } finally {
       setIsTelemetryLoading(false);
-    }
-  };
-
-  // Creates an interactive demonstration video via HTML5 Canvas
-  const createDemoVideoBlob = () => {
-    if (videoSrc) return;
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = 1280;
-      canvas.height = 720;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const stream = canvas.captureStream(30);
-      const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
-      const chunks: BlobPart[] = [];
-
-      recorder.ondataavailable = (e) => chunks.push(e.data);
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        setVideoSrc(url);
-        setVideoMetadata({
-          filename: 'Sample_Presentation_Demonstration.webm',
-          filepath: 'demo_presentation.webm',
-          file_size_bytes: blob.size,
-          file_size_mb: Math.round((blob.size / (1024 * 1024)) * 100) / 100 || 1.4,
-          format_name: 'WEBM',
-          duration_seconds: 8.0,
-          width: 1280,
-          height: 720,
-          aspect_ratio: '16:9',
-          fps: 30,
-          video_codec: 'vp8 / avc',
-          audio_codec: 'opus / aac',
-          audio_channels: 2,
-          audio_sample_rate: 48000,
-          bitrate_kbps: 4200,
-          has_audio: true,
-        });
-      };
-
-      recorder.start();
-
-      let frame = 0;
-      const totalFrames = 30 * 8; // 8 seconds
-
-      const draw = () => {
-        if (frame >= totalFrames) {
-          recorder.stop();
-          return;
-        }
-
-        // Animated studio background
-        const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-        grad.addColorStop(0, '#09090b');
-        grad.addColorStop(0.5, '#18181b');
-        grad.addColorStop(1, '#0f172a');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        // Animated concentric rings
-        const timeSec = frame / 30;
-        ctx.strokeStyle = `rgba(99, 102, 241, ${0.15 + Math.sin(timeSec * 2) * 0.1})`;
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.arc(640, 360, 140 + Math.sin(timeSec * 3) * 30, 0, Math.PI * 2);
-        ctx.stroke();
-
-        // Center card
-        ctx.fillStyle = 'rgba(24, 24, 27, 0.85)';
-        ctx.strokeStyle = 'rgba(99, 102, 241, 0.4)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.roundRect(320, 200, 640, 320, 16);
-        ctx.fill();
-        ctx.stroke();
-
-        // Title
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 36px Montserrat, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('AI VIDEO STUDIO', 640, 290);
-
-        // Subtitle
-        ctx.fillStyle = '#a1a1aa';
-        ctx.font = '18px Montserrat, sans-serif';
-        ctx.fillText('Local Kinetic Typography & Resolution Upscaling', 640, 335);
-
-        // Timecode
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = 'bold 24px monospace';
-        const tc = `00:00:0${Math.floor(timeSec)}:${String(frame % 30).padStart(2, '0')}`;
-        ctx.fillText(tc, 640, 420);
-
-        frame++;
-        requestAnimationFrame(draw);
-      };
-
-      draw();
-    } catch (err) {
-      console.warn('Canvas video generation fallback:', err);
-    }
-  };
-
-  // Handle local video selection
-  const handleSelectVideo = async () => {
-    try {
-      const { file } = await pickVideoFile();
-      setVideoFile(file);
-      const url = URL.createObjectURL(file);
-      setVideoSrc(url);
-
-      // Inspect metadata via API
-      try {
-        const meta = await apiClient.inspectVideo({
-          filename: file.name,
-          size: file.size,
-          width: 1920,
-          height: 1080,
-          duration: 10.0,
-        });
-        setVideoMetadata(meta);
-        setExportSettings((prev) => ({
-          ...prev,
-          outputFilename: `${file.name.replace(/\.[^/.]+$/, '')}_Rendered.mp4`,
-        }));
-      } catch {
-        // Fallback basic metadata
-        setVideoMetadata({
-          filename: file.name,
-          filepath: file.name,
-          file_size_bytes: file.size,
-          file_size_mb: Math.round((file.size / (1024 * 1024)) * 100) / 100,
-          format_name: file.name.split('.').pop()?.toUpperCase() || 'MP4',
-          duration_seconds: 10.0,
-          width: 1920,
-          height: 1080,
-          aspect_ratio: '16:9',
-          fps: 30,
-          video_codec: 'h264',
-          audio_codec: 'aac',
-          audio_channels: 2,
-          audio_sample_rate: 44100,
-          bitrate_kbps: 4500,
-          has_audio: true,
-        });
-      }
-
-      showToast(`Loaded ${file.name} successfully`, 'success');
-    } catch (err: any) {
-      if (err.message !== 'Selection cancelled') {
-        showToast(err.message || 'Failed to select video', 'error');
-      }
     }
   };
 
@@ -417,10 +238,14 @@ export default function App() {
 
   // Start speech transcription
   const handleStartTranscription = async (modelSize: string) => {
+    if (!videoMetadata?.filepath) {
+      showToast('Please upload a video before starting transcription.', 'error');
+      return;
+    }
     setIsTranscribing(true);
     try {
       const res = await apiClient.startTranscription(
-        videoMetadata?.filepath || 'source_video.mp4',
+        videoMetadata.filepath,
         modelSize
       );
       setActiveJob({
@@ -448,10 +273,18 @@ export default function App() {
 
   // Start Video Rendering
   const handleStartRender = async () => {
+    if (!videoMetadata?.filepath) {
+      showToast('Please upload a video before starting render.', 'error');
+      return;
+    }
+    if (segments.length === 0) {
+      showToast('Please transcribe speech or create subtitle segments before rendering.', 'error');
+      return;
+    }
     setIsRendering(true);
     try {
       const res = await apiClient.startRender({
-        input_video_path: videoMetadata?.filepath || 'source_video.mp4',
+        input_video_path: videoMetadata.filepath,
         segments,
         subtitle_style: subtitleStyle,
         enhancement,
@@ -490,12 +323,31 @@ export default function App() {
 
   // Save render directly using File System Access API
   const saveRenderResultDirectly = async (job: ProcessingJob) => {
-    if (!job.artifacts?.video_filename) return;
+    if (!job.artifacts?.video_filename || !job.artifacts?.video_url) return;
     try {
-      const dummyBlob = new Blob(['AI Video Studio Finished MP4 Stream'], { type: 'video/mp4' });
+      showToast(`Fetching rendered video from local engine...`, 'info');
+      const videoFetchUrl = `${apiClient.getBaseUrl()}${job.artifacts.video_url}`;
+      const response = await fetch(videoFetchUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch rendered video: ${response.status} ${response.statusText}`);
+      }
+
+      if (outputDir.handle && isDirectoryPickerSupported() && response.body) {
+        const hasPerm = await verifyPermission(outputDir.handle, true);
+        if (hasPerm) {
+          const fileHandle = await outputDir.handle.getFileHandle(job.artifacts.video_filename, { create: true });
+          const writable = await fileHandle.createWritable();
+          await response.body.pipeTo(writable);
+          showToast(`Saved rendered video directly to ${outputDir.name}/${job.artifacts.video_filename}`, 'success');
+          return;
+        }
+      }
+
+      // Fallback
+      const videoBlob = await response.blob();
       const res = await saveRenderToDirectory(
         job.artifacts.video_filename,
-        dummyBlob,
+        videoBlob,
         outputDir.handle
       );
       if (res.savedDirectly) {
@@ -503,15 +355,23 @@ export default function App() {
       } else {
         showToast(`Render ready for download: ${res.location}`, 'success');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Save render error:', err);
+      showToast(`Error saving render: ${err.message}`, 'error');
     }
   };
 
   // Download artifacts handler
   const handleDownloadArtifact = async (filename: string, content: string | Blob) => {
     try {
-      const res = await saveRenderToDirectory(filename, content, outputDir.handle);
+      let dataToSave = content;
+      if (typeof content === 'string' && (content.startsWith('/') || content.startsWith('http'))) {
+        const fetchUrl = content.startsWith('http') ? content : `${apiClient.getBaseUrl()}${content}`;
+        const res = await fetch(fetchUrl);
+        if (!res.ok) throw new Error(`Failed to download artifact: ${res.statusText}`);
+        dataToSave = await res.blob();
+      }
+      const res = await saveRenderToDirectory(filename, dataToSave, outputDir.handle);
       if (res.savedDirectly) {
         showToast(`Saved ${filename} to ${outputDir.name}`, 'success');
       } else {
@@ -588,8 +448,29 @@ export default function App() {
         onOpenSettings={() => setActiveTab('settings')}
         telemetry={telemetry}
         isPythonEngine={isPythonEngine}
+        isBackendConnected={isBackendConnected}
         isSaving={isSaving}
       />
+
+      {/* Backend Disconnected Warning Banner */}
+      {!isBackendConnected && isBackendConnected !== null && (
+        <div className="bg-red-950/90 border-b border-red-500/40 px-4 py-2 text-xs flex flex-wrap items-center justify-between text-red-200 gap-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>
+              <strong>LOCAL BACKEND DISCONNECTED:</strong> The Python FastAPI engine (port 8000) is offline.
+              Launch it on your PC using <code className="bg-red-900/60 px-1.5 py-0.5 rounded font-mono text-red-100 font-semibold">START_AI_VIDEO_STUDIO.bat</code>.
+            </span>
+          </div>
+          <button
+            onClick={loadHardwareInfo}
+            disabled={isTelemetryLoading}
+            className="px-3 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-xs font-semibold cursor-pointer shrink-0 disabled:opacity-50 flex items-center gap-1.5 transition-colors"
+          >
+            Retry Connection
+          </button>
+        </div>
+      )}
 
       {/* Main Studio Body */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
@@ -630,7 +511,7 @@ export default function App() {
               <MediaPanel
                 metadata={videoMetadata}
                 onSelectVideo={handleSelectVideo}
-                onLoadDemo={createDemoVideoBlob}
+                onLoadDemo={handleSelectVideo}
                 onFileDrop={handleFileDrop}
               />
             )}
@@ -695,7 +576,7 @@ export default function App() {
               onTimeUpdate={setCurrentTime}
               onDurationChange={setDuration}
               onSelectVideo={handleSelectVideo}
-              onLoadDemoVideo={createDemoVideoBlob}
+              onLoadDemoVideo={handleSelectVideo}
             />
           </div>
 
@@ -729,7 +610,7 @@ export default function App() {
               <span className="font-semibold text-zinc-300">GPU & Hardware Stats</span>
               <button
                 onClick={() => setIsHardwareOpen(true)}
-                className="text-[10px] text-indigo-400 hover:text-indigo-300 underline"
+                className="text-[10px] text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
               >
                 Inspect
               </button>
@@ -738,26 +619,30 @@ export default function App() {
               <div className="flex justify-between">
                 <span>GPU:</span>
                 <span className="font-mono text-zinc-200 truncate max-w-[140px]" title={telemetry?.gpu.model}>
-                  {telemetry?.gpu.model || 'NVIDIA RTX 5060'}
+                  {telemetry?.gpu.detected ? telemetry.gpu.model : 'CPU Mode (No GPU)'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span>Encoder:</span>
-                <span className="font-mono text-emerald-400 font-semibold">
-                  {telemetry?.recommended_encoder || 'av1_nvenc'}
+                <span className={`font-mono font-semibold ${telemetry?.recommended_encoder?.includes('nvenc') ? 'text-emerald-400' : 'text-zinc-300'}`}>
+                  {telemetry?.recommended_encoder || 'libx264'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span>VRAM:</span>
                 <span className="font-mono text-zinc-200">
-                  {telemetry?.gpu.vram_total_mb
+                  {telemetry?.gpu.detected && telemetry.gpu.vram_total_mb > 0
                     ? `${Math.round((telemetry.gpu.vram_total_mb - telemetry.gpu.vram_free_mb) / 1024 * 10) / 10} / ${Math.round(telemetry.gpu.vram_total_mb / 1024 * 10) / 10} GB`
-                    : 'GDDR7 Dynamic'}
+                    : 'N/A'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span>Arch:</span>
-                <span className="font-mono text-purple-300">Blackwell Gen 9</span>
+                <span className="font-mono text-purple-300">
+                  {telemetry?.gpu.detected
+                    ? (telemetry.gpu.is_blackwell ? 'Blackwell Gen 9' : (telemetry.cuda?.arch_compatibility || 'NVIDIA CUDA'))
+                    : 'Host CPU'}
+                </span>
               </div>
             </div>
           </div>

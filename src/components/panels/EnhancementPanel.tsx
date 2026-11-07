@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { EnhancementConfig, PresetName, ENHANCEMENT_PRESETS, requiresAiModelRunner } from '../../utils/enhancementEngine';
-import { Sliders, Sparkles, Cpu, ShieldAlert, Check, RefreshCw } from 'lucide-react';
+import { Sliders, Sparkles, Cpu, ShieldAlert, Check, RefreshCw, AlertTriangle } from 'lucide-react';
+import { apiClient } from '../../services/apiClient';
 
 interface Props {
   config: EnhancementConfig;
@@ -15,6 +16,18 @@ export const EnhancementPanel: React.FC<Props> = ({
   onPreviewRefresh,
   isGeneratingPreview,
 }) => {
+  const [modelsStatus, setModelsStatus] = useState<any>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    apiClient.getModelsStatus()
+      .then((status) => {
+        if (mounted) setModelsStatus(status);
+      })
+      .catch(() => {});
+    return () => { mounted = false; };
+  }, []);
+
   const update = (patch: Partial<EnhancementConfig>) => {
     onChange({ ...config, ...patch, preset: 'Custom' });
   };
@@ -30,6 +43,7 @@ export const EnhancementPanel: React.FC<Props> = ({
   };
 
   const isAiActive = requiresAiModelRunner(config);
+  const realEsrganAvailable = modelsStatus?.realesrgan?.available ?? false;
 
   return (
     <div className="space-y-4">
@@ -115,6 +129,32 @@ export const EnhancementPanel: React.FC<Props> = ({
             </select>
           </div>
         </div>
+
+        {/* Real-ESRGAN Availability / Transparency Banner */}
+        {config.aiModel !== 'None' ? (
+          modelsStatus && !realEsrganAvailable ? (
+            <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+              <div>
+                <span className="font-semibold block">Real-ESRGAN Model Unavailable</span>
+                <span>
+                  The Real-ESRGAN package is not installed in your Python backend environment.
+                  Select <strong>None (Conventional Lanczos)</strong> for standard FFmpeg scaling, or install Real-ESRGAN.
+                </span>
+              </div>
+            </div>
+          ) : realEsrganAvailable ? (
+            <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px] flex items-center gap-2">
+              <Check className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+              <span>Real-ESRGAN ready on {modelsStatus?.realesrgan?.device || 'CUDA GPU'}.</span>
+            </div>
+          ) : null
+        ) : (
+          <div className="p-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 text-[11px] flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-zinc-500" />
+            <span>Using conventional FFmpeg Lanczos scaler. Not labeled as AI.</span>
+          </div>
+        )}
 
         {/* Tiled Processing Toggle & VRAM Safeguard */}
         <div className="pt-2 border-t border-zinc-850/60 space-y-2">

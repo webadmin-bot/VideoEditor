@@ -1,165 +1,174 @@
+import os
 import shutil
 import subprocess
-import os
-import json
 import time
 from pathlib import Path
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Optional, Callable
 from .enhancer import build_enhancement_filter_string
-from .hardware import check_ffmpeg, check_nvidia_smi
+from .video_inspector import inspect_video_file
+from .hardware import check_ffmpeg, test_encoder_initialization
 
 def render_final_video(
-    input_video_path: str,
-    output_video_path: str,
-    ass_subtitle_path: Optional[str],
-    enhancement_config: Dict[str, Any],
-    export_config: Dict[str, Any],
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    input_path: str,
+    output_path: str,
+    ass_path: str,
+    enhancement: Dict[str, Any],
+    export_settings: Dict[str, Any],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    job_ref: Optional[Any] = None
 ) -> Dict[str, Any]:
-    """
-    Renders the final processed video using FFmpeg.
-    Burns kinetic ASS subtitles, applies enhancements, and encodes with GPU/CPU.
-    """
+    in_file = Path(input_path)
+    if not in_file.exists():
+        raise FileNotFoundError(f"Input video file not found for render: {input_path}")
+
+    # Inspect input to determine duration for accurate progress computation
+    input_meta = inspect_video_file(str(in_file.resolve()))
+    total_duration = max(0.5, float(input_meta.get("duration_seconds", 1.0)))
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("FFmpeg executable not found on system PATH.")
+        raise RuntimeError("FFmpeg executable is not available on system PATH.")
 
-    in_path = Path(input_video_path)
-    out_path = Path(output_video_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    requested_codec = export_settings.get("videoCodec", "auto")
+    hw_info = check_ffmpeg()
+    verified_encoders = hw_info.get("verified_encoders", [])
 
-    # Determine hardware encoder
-    gpu_info = check_nvidia_smi()
-    ffmpeg_info = check_ffmpeg()
-    
-    preferred_codec = export_config.get("videoCodec", "auto")
-    encoders_avail = ffmpeg_info.get("encoders", [])
-    has_gpu = gpu_info.get("detected", False)
-
-    # Blackwell Gen 9 NVENC supports AV1, HEVC, and H.264
-    if preferred_codec == "av1_nvenc" or (preferred_codec == "auto" and has_gpu and "av1_nvenc" in encoders_avail):
-        vcodec = "av1_nvenc" if (has_gpu and "av1_nvenc" in encoders_avail) else "libsvtav1"
-    elif preferred_codec in ["hevc", "hevc_nvenc"]:
-        vcodec = "hevc_nvenc" if (has_gpu and "hevc_nvenc" in encoders_avail) else "libx265"
-    elif preferred_codec in ["h264_nvenc", "h264", "auto"]:
-        vcodec = "h264_nvenc" if (has_gpu and "h264_nvenc" in encoders_avail) else "libx264"
+    if requested_codec == "auto":
+        # Select best successfully verified hardware encoder
+        if "av1_nvenc" in verified_encoders:
+            codec = "av1_nvenc"
+        elif "hevc_nvenc" in verified_encoders:
+            codec = "hevc_nvenc"
+        elif "h264_nvenc" in verified_encoders:
+            codec = "h264_nvenc"
+        else:
+            codec = "libx264"
     else:
-        vcodec = preferred_codec
+        # User specified an encoder — verify it actually initializes on current hardware
+        if "nvenc" in requested_codec:
+            if requested_codec in verified_encoders or test_encoder_initialization(ffmpeg, requested_codec):
+                codec = requested_codec
+            else:
+                # NVENC initialization failed on hardware, fallback to libx264
+                codec = "libx264"
+        else:
+            codec = requested_codec
 
-    # Assemble filter chain
-    filter_elements = []
+    crf = export_settings.get("qualityCrf", 20)
+    audio_codec = export_settings.get("audioCodec", "copy")
+    fps = export_settings.get("fps", 30)
 
-    target_w = export_config.get("width", 1920)
-    target_h = export_config.get("height", 1080)
+    # Validate AI model if selected
+    ai_model = enhancement.get("aiModel", "None")
+    if ai_model and ai_model not in ["None", "none", ""]:
+        from .enhancer import check_realesrgan_available
+        realesr_status = check_realesrgan_available()
+        if not realesr_status["available"]:
+            raise RuntimeError(
+                f"AI upscaling was requested with model '{ai_model}', but Real-ESRGAN is not installed. "
+                "Please install Real-ESRGAN (`pip install realesrgan`) and model weights, "
+                "or set AI Engine Model to 'None (Conventional Scaling)' in the Upscale panel."
+            )
 
-    # 1. Video enhancement filters (denoise, eq, unsharp)
-    enh_filters = build_enhancement_filter_string(enhancement_config, target_w, target_h)
-    if enh_filters:
-        filter_elements.append(enh_filters)
+    # Build filter chain
+    filters = []
+    enh_filters = build_enhancement_filter_string(enhancement)
+    if enh_filters and enh_filters != "null":
+        filters.append(enh_filters)
 
-    # 2. Burn kinetic subtitles if provided
-    if ass_subtitle_path and Path(ass_subtitle_path).exists():
-        # Escape path for FFmpeg filter syntax (especially colons and backslashes on Windows)
-        safe_ass_path = str(Path(ass_subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
-        filter_elements.append(f"ass='{safe_ass_path}'")
-
-    combined_filter = ",".join(filter_elements) if filter_elements else None
-
-    # Quality preset and bitrate
-    quality_crf = export_config.get("qualityCrf", 20)
-    preset = "p4" if "nvenc" in vcodec else "medium"
+    if Path(ass_path).exists():
+        escaped_ass = str(Path(ass_path).resolve()).replace("\\", "/").replace(":", "\\:")
+        filters.append(f"ass='{escaped_ass}'")
 
     cmd = [
-        ffmpeg,
-        "-y",
-        "-i", str(in_path)
+        ffmpeg, "-y",
+        "-i", str(in_file.resolve())
     ]
 
-    if combined_filter:
-        cmd.extend(["-vf", combined_filter])
+    if filters:
+        cmd.extend(["-vf", ",".join(filters)])
 
     cmd.extend([
-        "-c:v", vcodec,
-        "-preset", preset,
+        "-c:v", codec,
+        "-r", str(fps),
     ])
 
-    if "nvenc" in vcodec:
-        cmd.extend(["-cq", str(quality_crf), "-b:v", "0"])
+    if "nvenc" in codec:
+        cmd.extend(["-cq", str(crf)])
     else:
-        cmd.extend(["-crf", str(quality_crf)])
+        cmd.extend(["-crf", str(crf)])
 
-    # Audio handling: preserve original or encode to AAC
-    audio_codec = export_config.get("audioCodec", "copy")
-    if audio_codec == "copy":
-        cmd.extend(["-c:a", "copy"])
-    else:
-        cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-
-    # Progress reporting pipe
     cmd.extend([
+        "-c:a", audio_codec if audio_codec != "copy" else "aac",
         "-progress", "pipe:1",
-        str(out_path)
+        str(Path(output_path).resolve())
     ])
 
-    start_time = time.time()
-
-    # Execute FFmpeg process with safe pipe reading
-    process = subprocess.Popen(
+    # Launch subprocess with piped progress
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1,
-        universal_newlines=True
+        bufsize=1
     )
 
-    total_duration_sec = export_config.get("duration", 10.0)
+    if job_ref and hasattr(job_ref, "set_process"):
+        job_ref.set_process(proc)
 
-    try:
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            
-            line_str = line.strip()
-            if line_str.startswith("out_time_ms="):
-                try:
-                    out_time_us = int(line_str.split("=")[1])
-                    curr_sec = out_time_us / 1000000.0
-                    pct = min(99.0, max(0.0, (curr_sec / max(0.1, total_duration_sec)) * 100.0))
-                    elapsed = time.time() - start_time
-                    eta = (elapsed / max(1.0, curr_sec)) * (total_duration_sec - curr_sec) if curr_sec > 0 else 0
+    # Read progress from stdout
+    last_reported_pct = 0.0
+    while True:
+        if job_ref and getattr(job_ref, "cancelled", False):
+            proc.terminate()
+            time.sleep(0.1)
+            proc.kill()
+            raise RuntimeError("Rendering cancelled by user.")
 
+        line = proc.stdout.readline() if proc.stdout else ""
+        if not line and proc.poll() is not None:
+            break
+
+        line = line.strip()
+        if line.startswith("out_time_us="):
+            try:
+                us_val = int(line.split("=")[1])
+                cur_secs = us_val / 1000000.0
+                pct = min(99.0, max(0.0, (cur_secs / total_duration) * 100.0))
+                if round(pct, 1) != last_reported_pct:
+                    last_reported_pct = round(pct, 1)
                     if progress_callback:
                         progress_callback({
                             "stage": "RENDERING",
-                            "progress_percent": round(pct, 1),
-                            "current_time_sec": round(curr_sec, 2),
-                            "elapsed_seconds": round(elapsed, 1),
-                            "estimated_remaining_seconds": round(max(0, eta), 1),
-                            "encoder": vcodec
+                            "progress_percent": last_reported_pct,
+                            "current_time_sec": round(cur_secs, 1),
+                            "encoder": codec
                         })
-                except Exception:
-                    pass
+            except (ValueError, IndexError):
+                pass
+        elif line == "progress=end":
+            break
 
-        returncode = process.wait()
-        if returncode != 0:
-            stderr_out = process.stderr.read()
-            raise RuntimeError(f"FFmpeg rendering failed with exit code {returncode}: {stderr_out}")
+    _, stderr = proc.communicate()
+    if proc.returncode != 0:
+        err_msg = stderr.strip() if stderr else "Unknown FFmpeg error"
+        raise RuntimeError(f"FFmpeg rendering failed (code {proc.returncode}): {err_msg}")
 
-    except Exception as e:
-        process.kill()
-        raise e
+    # Validate output using FFprobe
+    out_file = Path(output_path)
+    if not out_file.exists() or out_file.stat().st_size == 0:
+        raise RuntimeError(f"Render completed but output file does not exist or is 0 bytes: {output_path}")
 
-    elapsed_total = round(time.time() - start_time, 2)
-    out_size_mb = round(out_path.stat().st_size / (1024 * 1024), 2) if out_path.exists() else 0.0
+    # Inspect rendered file to guarantee container and video stream integrity
+    output_meta = inspect_video_file(str(out_file.resolve()))
+    sz_mb = output_meta.get("file_size_mb", 0.0)
 
     return {
         "success": True,
-        "output_path": str(out_path),
-        "file_size_mb": out_size_mb,
-        "elapsed_seconds": elapsed_total,
-        "encoder_used": vcodec,
-        "burned_subtitles": bool(ass_subtitle_path),
-        "target_resolution": f"{target_w}x{target_h}"
+        "file_size_mb": sz_mb,
+        "encoder": codec,
+        "encoder_requested": requested_codec,
+        "nvenc_active": "nvenc" in codec,
+        "output_path": str(out_file.resolve()),
+        "output_metadata": output_meta
     }

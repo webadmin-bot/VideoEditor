@@ -1,114 +1,130 @@
+import os
 import json
 import shutil
 import subprocess
-import base64
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
-def inspect_video_file(file_path: str, generate_thumbnail: bool = True) -> Dict[str, Any]:
-    """Inspects video stream properties using ffprobe."""
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Video file not found at: {file_path}")
+def inspect_video_file(filepath: str) -> Dict[str, Any]:
+    file_path_obj = Path(filepath)
+    if not file_path_obj.exists():
+        raise FileNotFoundError(f"Video file does not exist on disk: {filepath}")
+
+    file_size = file_path_obj.stat().st_size
+    if file_size == 0:
+        raise ValueError(f"Video file is empty (0 bytes): {filepath}")
+
+    file_size_mb = round(file_size / (1024 * 1024), 2)
 
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        # Fallback metadata from file stats if ffprobe is absent
-        size_bytes = path.stat().st_size
-        return {
-            "filename": path.name,
-            "filepath": str(path.resolve()),
-            "file_size_bytes": size_bytes,
-            "file_size_mb": round(size_bytes / (1024 * 1024), 2),
-            "format_name": path.suffix.replace(".", "").upper(),
-            "duration_seconds": 10.0,
-            "width": 1920,
-            "height": 1080,
-            "fps": 30.0,
-            "video_codec": "h264",
-            "audio_codec": "aac",
-            "audio_channels": 2,
-            "audio_sample_rate": 44100,
-            "bitrate_kbps": 5000,
-            "thumbnail_base64": None,
-            "has_audio": True,
-            "warning": "FFprobe was not found on system PATH. Install FFmpeg for precise inspection."
-        }
+        raise RuntimeError("FFprobe executable is not available on system PATH. Please install FFmpeg.")
 
     cmd = [
         ffprobe,
-        "-v", "quiet",
+        "-v", "error",
         "-print_format", "json",
         "-show_format",
         "-show_streams",
-        str(path)
+        str(file_path_obj.resolve())
     ]
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"FFprobe timed out inspecting: {filepath}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to execute FFprobe: {str(e)}")
+
     if res.returncode != 0:
-        raise RuntimeError(f"FFprobe inspection failed: {res.stderr}")
+        err_msg = res.stderr.strip() or "Unknown FFprobe failure"
+        raise RuntimeError(f"FFprobe error inspecting video: {err_msg}")
 
-    data = json.loads(res.stdout)
-    fmt = data.get("format", {})
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"FFprobe produced invalid JSON output: {str(e)}")
+
     streams = data.get("streams", [])
+    format_info = data.get("format", {})
 
-    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
-    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    v_streams = [s for s in streams if s.get("codec_type") == "video"]
+    if not v_streams:
+        raise ValueError(f"No video streams detected in media file: {file_path_obj.name}")
 
-    width = int(video_stream.get("width", 1920)) if video_stream else 1920
-    height = int(video_stream.get("height", 1080)) if video_stream else 1080
-    
-    fps = 30.0
-    if video_stream and "r_frame_rate" in video_stream:
+    v = v_streams[0]
+    width = int(v.get("width", 0))
+    height = int(v.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid video dimensions detected ({width}x{height}) in {file_path_obj.name}")
+
+    video_codec = v.get("codec_name", "unknown")
+
+    # Determine frame rate
+    r_frame_rate = v.get("r_frame_rate", "0/1")
+    fps = 0.0
+    if "/" in r_frame_rate:
+        num, den = r_frame_rate.split("/")
+        den_val = float(den)
+        if den_val > 0:
+            fps = round(float(num) / den_val, 2)
+    elif r_frame_rate:
         try:
-            num, den = video_stream["r_frame_rate"].split("/")
-            fps = round(float(num) / float(den), 2)
-        except Exception:
-            fps = 30.0
+            fps = round(float(r_frame_rate), 2)
+        except ValueError:
+            fps = 0.0
 
-    duration = float(fmt.get("duration", video_stream.get("duration", 0.0) if video_stream else 0.0))
-    size_bytes = int(fmt.get("size", path.stat().st_size))
-    bitrate = int(fmt.get("bit_rate", 0)) // 1000
-
-    thumbnail_b64: Optional[str] = None
-    ffmpeg = shutil.which("ffmpeg")
-    if generate_thumbnail and ffmpeg and duration > 0:
+    # Determine duration
+    duration = 0.0
+    if "duration" in format_info:
         try:
-            # Extract frame at 1s or half duration
-            seek_pos = min(1.0, duration / 2.0)
-            thumb_cmd = [
-                ffmpeg,
-                "-y",
-                "-ss", str(seek_pos),
-                "-i", str(path),
-                "-vframes", "1",
-                "-vf", "scale=640:-1",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "pipe:1"
-            ]
-            thumb_res = subprocess.run(thumb_cmd, capture_output=True)
-            if thumb_res.returncode == 0 and thumb_res.stdout:
-                thumbnail_b64 = "data:image/jpeg;base64," + base64.b64encode(thumb_res.stdout).decode("utf-8")
-        except Exception:
+            duration = round(float(format_info["duration"]), 2)
+        except ValueError:
+            pass
+    elif "duration" in v:
+        try:
+            duration = round(float(v["duration"]), 2)
+        except ValueError:
             pass
 
+    # Determine bitrate
+    bitrate = 0
+    if "bit_rate" in format_info:
+        try:
+            bitrate = int(int(format_info["bit_rate"]) / 1000)
+        except (ValueError, TypeError):
+            pass
+
+    # Audio stream inspection
+    a_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    has_audio = len(a_streams) > 0
+    audio_codec = ""
+    audio_channels = 0
+    audio_sample_rate = 0
+
+    if has_audio:
+        a = a_streams[0]
+        audio_codec = a.get("codec_name", "")
+        audio_channels = int(a.get("channels", 0))
+        audio_sample_rate = int(a.get("sample_rate", 0))
+
+    format_name = format_info.get("format_name", file_path_obj.suffix.replace(".", "").upper())
+
     return {
-        "filename": path.name,
-        "filepath": str(path.resolve()),
-        "file_size_bytes": size_bytes,
-        "file_size_mb": round(size_bytes / (1024 * 1024), 2),
-        "format_name": fmt.get("format_name", path.suffix.replace(".", "")),
-        "duration_seconds": round(duration, 2),
+        "filename": file_path_obj.name,
+        "filepath": str(file_path_obj.resolve()),
+        "file_size_bytes": file_size,
+        "file_size_mb": file_size_mb,
+        "format_name": format_name,
+        "duration_seconds": duration,
         "width": width,
         "height": height,
         "aspect_ratio": f"{width}:{height}",
         "fps": fps,
-        "video_codec": video_stream.get("codec_name", "unknown") if video_stream else "none",
-        "audio_codec": audio_stream.get("codec_name", "none") if audio_stream else "none",
-        "audio_channels": int(audio_stream.get("channels", 0)) if audio_stream else 0,
-        "audio_sample_rate": int(audio_stream.get("sample_rate", 0)) if audio_stream else 0,
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
+        "audio_channels": audio_channels,
+        "audio_sample_rate": audio_sample_rate,
         "bitrate_kbps": bitrate,
-        "thumbnail_base64": thumbnail_b64,
-        "has_audio": bool(audio_stream),
+        "has_audio": has_audio,
     }

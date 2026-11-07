@@ -118,10 +118,10 @@ export const JobQueuePanel: React.FC<Props> = ({
                 onClick={() =>
                   onDownloadArtifact(
                     activeJob.artifacts?.video_filename || 'rendered_video.mp4',
-                    new Blob([], { type: 'video/mp4' })
+                    activeJob.artifacts?.video_url || ''
                   )
                 }
-                className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-emerald-600/15 hover:bg-emerald-600/25 border border-emerald-500/30 text-emerald-300 text-xs font-medium transition-colors text-left"
+                className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-emerald-600/15 hover:bg-emerald-600/25 border border-emerald-500/30 text-emerald-300 text-xs font-medium transition-colors text-left cursor-pointer"
               >
                 <div className="flex items-center gap-2">
                   <Film className="w-4 h-4" />
